@@ -1,5 +1,17 @@
 # pve-import-template
 
+New
+
+Wget
+```
+wget -O - https://raw.githubusercontent.com/ISIFNET/pve-import-template/refs/heads/master/run.sh | bash
+```
+
+```
+curl https://raw.githubusercontent.com/ISIFNET/pve-import-template/refs/heads/master/run.sh | bash
+```
+
+
 安装 git 并克隆仓库：
 
 ```
