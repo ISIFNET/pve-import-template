@@ -49,6 +49,15 @@ templates:
       commands:
         - *command_permit_root_login
 
+  - vmid: 9004
+    name: ubuntu-24.10
+    url: https://cloud-images.ubuntu.com/oracular/current/oracular-server-cloudimg-amd64.img
+    cloud_init: true
+    customize:
+      uploads:
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_nerocloud_ssh.cfg
+      commands:
+        - *command_permit_root_login
   # Debian 91xx
 
   - vmid: 9100
@@ -134,3 +143,33 @@ templates:
     url: https://download.mikrotik.com/routeros/7.7/chr-7.7.img.zip
     unpack: unzip -p {dl} chr-7.7.img > {img}
     cloud_init: false
+
+  - vmid: 9400
+    name: ArchLinux
+    url: https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2
+    cloud_init: true
+    customize:
+      uploads:
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_nerocloud_ssh.cfg
+      commands:
+        - *command_permit_root_login
+
+  - vmid: 9500
+    name: AlpineLinux-3.20.3
+    url: https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/cloud/nocloud_alpine-3.20.3-x86_64-bios-cloudinit-r0.qcow2
+    cloud_init: true
+    customize:
+      uploads:
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_nerocloud_ssh.cfg
+      commands:
+        - *command_permit_root_login
+
+  - vmid: 9501
+    name: AlpineLinux-3.19.4
+    url: https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/cloud/nocloud_alpine-3.19.4-x86_64-bios-cloudinit-r0.qcow2
+    cloud_init: true
+    customize:
+      uploads:
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_nerocloud_ssh.cfg
+      commands:
+        - *command_permit_root_login
