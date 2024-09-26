@@ -15,7 +15,7 @@ templates:
     cloud_init: true
     customize:
       uploads:
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_nerocloud_ssh.cfg
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
 
@@ -25,7 +25,7 @@ templates:
     cloud_init: true
     customize:
       uploads:
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_nerocloud_ssh.cfg
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
 
@@ -35,7 +35,7 @@ templates:
     cloud_init: true
     customize:
       uploads:
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_nerocloud_ssh.cfg
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
 
@@ -45,7 +45,7 @@ templates:
     cloud_init: true
     customize:
       uploads:
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_nerocloud_ssh.cfg
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
 
@@ -55,7 +55,7 @@ templates:
     cloud_init: true
     customize:
       uploads:
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_nerocloud_ssh.cfg
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
   # Debian 91xx
@@ -66,7 +66,7 @@ templates:
     cloud_init: true
     customize:
       uploads:
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_nerocloud_ssh.cfg
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
 
@@ -76,7 +76,7 @@ templates:
     cloud_init: true
     customize:
       uploads:
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_nerocloud_ssh.cfg
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
 
@@ -86,7 +86,7 @@ templates:
     cloud_init: true
     customize:
       uploads:
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_nerocloud_ssh.cfg
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
 
@@ -96,7 +96,7 @@ templates:
     cloud_init: true
     customize:
       uploads:
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_nerocloud_ssh.cfg
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
 
@@ -114,7 +114,7 @@ templates:
         # 也许是因为它有 chattr +i 之类的属性。但 virt-customize 执行命令时也没有报错，没法查具体原因。
         # 虽然上传 /dev/null 看起来有点奇怪，但实际上它传过去就会变成普通的空文件。
         - /dev/null:/etc/resolv.conf
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_nerocloud_ssh.cfg
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
 
@@ -126,7 +126,7 @@ templates:
       uploads:
         # 同上
         - /dev/null:/etc/resolv.conf
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_nerocloud_ssh.cfg
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
 
@@ -150,7 +150,7 @@ templates:
     cloud_init: true
     customize:
       uploads:
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_nerocloud_ssh.cfg
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
 
@@ -160,7 +160,7 @@ templates:
     cloud_init: true
     customize:
       uploads:
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_nerocloud_ssh.cfg
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
 
@@ -170,6 +170,6 @@ templates:
     cloud_init: true
     customize:
       uploads:
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_nerocloud_ssh.cfg
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
