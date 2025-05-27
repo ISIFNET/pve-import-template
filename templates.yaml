@@ -6,11 +6,7 @@ aliases:
     fi
 
 templates:
-
-  # Ubuntu 90xx
-
-  - vmid: 9000
-    name: ubuntu-16.04
+  - name: ubuntu-16.04
     url: https://cloud-images.ubuntu.com/xenial/current/xenial-server-cloudimg-amd64-disk1.img
     cloud_init: true
     customize:
@@ -19,8 +15,7 @@ templates:
       commands:
         - *command_permit_root_login
 
-  - vmid: 9001
-    name: ubuntu-18.04
+  - name: ubuntu-18.04
     url: https://cloud-images.ubuntu.com/bionic/current/bionic-server-cloudimg-amd64.img
     cloud_init: true
     customize:
@@ -29,8 +24,7 @@ templates:
       commands:
         - *command_permit_root_login
 
-  - vmid: 9002
-    name: ubuntu-20.04
+  - name: ubuntu-20.04
     url: https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img
     cloud_init: true
     customize:
@@ -39,8 +33,7 @@ templates:
       commands:
         - *command_permit_root_login
 
-  - vmid: 9003
-    name: ubuntu-22.04
+  - name: ubuntu-22.04
     url: https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img
     cloud_init: true
     customize:
@@ -49,8 +42,7 @@ templates:
       commands:
         - *command_permit_root_login
 
-  - vmid: 9004
-    name: ubuntu-24.10
+  - name: ubuntu-24.10
     url: https://cloud-images.ubuntu.com/oracular/current/oracular-server-cloudimg-amd64.img
     cloud_init: true
     customize:
@@ -58,10 +50,8 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-  # Debian 91xx
 
-  - vmid: 9100
-    name: debian-9
+  - name: debian-9
     url: https://cloud.debian.org/images/openstack/current-9/debian-9-openstack-amd64.qcow2
     cloud_init: true
     customize:
@@ -70,8 +60,7 @@ templates:
       commands:
         - *command_permit_root_login
 
-  - vmid: 9101
-    name: debian-10
+  - name: debian-10
     url: https://cloud.debian.org/images/openstack/current-10/debian-10-openstack-amd64.qcow2
     cloud_init: true
     customize:
@@ -80,8 +69,7 @@ templates:
       commands:
         - *command_permit_root_login
 
-  - vmid: 9102
-    name: debian-11
+  - name: debian-11
     url: https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-genericcloud-amd64.qcow2
     cloud_init: true
     customize:
@@ -90,8 +78,7 @@ templates:
       commands:
         - *command_permit_root_login
 
-  - vmid: 9103
-    name: debian-12
+  - name: debian-12
     url: https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2
     cloud_init: true
     customize:
@@ -100,26 +87,7 @@ templates:
       commands:
         - *command_permit_root_login
 
-  # CentOS 92xx
-
-  - vmid: 9200
-    name: centos-7
-    url: http://cloud.centos.org/centos/7/images/CentOS-7-x86_64-GenericCloud-2009.qcow2
-    cloud_init: true
-    customize:
-      uploads:
-        # 不知道为什么，如果用命令来删除 /etc/resolv.conf 的内容，
-        # 无论是 rm 再 touch，还是用 echo > 写入，都删不掉这个文件里面的内容。
-        # 但是像这样上传一个空文件去替换掉它就没问题。
-        # 也许是因为它有 chattr +i 之类的属性。但 virt-customize 执行命令时也没有报错，没法查具体原因。
-        # 虽然上传 /dev/null 看起来有点奇怪，但实际上它传过去就会变成普通的空文件。
-        - /dev/null:/etc/resolv.conf
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      commands:
-        - *command_permit_root_login
-
-  - vmid: 9201
-    name: centos-8
+  - name: centos-8
     url: http://cloud.centos.org/centos/8/x86_64/images/CentOS-8-GenericCloud-8.4.2105-20210603.0.x86_64.qcow2
     cloud_init: true
     customize:
@@ -130,22 +98,7 @@ templates:
       commands:
         - *command_permit_root_login
 
-  # RouterOS 93xx
-
-  - vmid: 9301
-    name: chr-6.48.6
-    url: https://download.mikrotik.com/routeros/6.48.6/chr-6.48.6.img.zip
-    unpack: unzip -p {dl} chr-6.48.6.img > {img}
-    cloud_init: false
-
-  - vmid: 9302
-    name: chr-7.7
-    url: https://download.mikrotik.com/routeros/7.7/chr-7.7.img.zip
-    unpack: unzip -p {dl} chr-7.7.img > {img}
-    cloud_init: false
-
-  - vmid: 9400
-    name: ArchLinux
+  - name: archLinux
     url: https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2
     cloud_init: true
     customize:
@@ -154,9 +107,8 @@ templates:
       commands:
         - *command_permit_root_login
 
-  - vmid: 9500
-    name: AlpineLinux-3.20.3
-    url: https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/cloud/nocloud_alpine-3.20.3-x86_64-bios-cloudinit-r0.qcow2
+  - name: alpineLinux-3.21
+    url: https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/cloud/generic_alpine-3.21.2-x86_64-bios-cloudinit-r0.qcow2
     cloud_init: true
     customize:
       uploads:
@@ -164,9 +116,17 @@ templates:
       commands:
         - *command_permit_root_login
 
-  - vmid: 9501
-    name: AlpineLinux-3.19.4
-    url: https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/cloud/nocloud_alpine-3.19.4-x86_64-bios-cloudinit-r0.qcow2
+  - name: almaLinux-8
+    url: https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/AlmaLinux-8-GenericCloud-latest.x86_64.qcow2
+    cloud_init: true
+    customize:
+      uploads:
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
+      commands:
+        - *command_permit_root_login
+
+  - name: almaLinux-9
+    url: https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-OpenNebula-9.6-20250522.x86_64.qcow2
     cloud_init: true
     customize:
       uploads:

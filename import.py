@@ -2,18 +2,15 @@
 
 import sys
 import os
-import re
 import contextlib
 import urllib.request
 import subprocess
 import json
 
-
 def exit_missing_dep():
     print('Some dependencies are missing.')
     print('Please run setup.sh to install them.')
     sys.exit(2)
-
 
 try:
     import tqdm
@@ -21,23 +18,18 @@ try:
 except ImportError:
     exit_missing_dep()
 
-
 class DownloadProgressBar(tqdm.tqdm):
     def update_to(self, b=1, bsize=1, tsize=None):
         if tsize is not None:
             self.total = tsize
         self.update(b * bsize - self.n)
 
-
 class StorageInfo:
     class Base:
         def __init__(self, name) -> None:
             self.name = name
-
-        def format_disk_name(vmid: int):
-            # https://pve.proxmox.com/pve-docs/chapter-pvesm.html
-            # Should not reach here
-            pass
+        def format_disk_name(self, vmid: int):
+            raise NotImplementedError
 
     class Dir(Base):
         def format_disk_name(self, vmid: int):
@@ -47,145 +39,121 @@ class StorageInfo:
         def format_disk_name(self, vmid: int):
             return f'vm-{vmid}-disk-0'
 
-
-def run(cmd: str, **kwargs):
+def run(cmd, **kwargs):
     print(f'# {cmd}')
     subprocess.run(cmd, env=kwargs, shell=isinstance(cmd, str))
 
-
 def check_storage(name: str) -> StorageInfo.Base:
-    # https://github.com/proxmox/pve-storage/blob/b4616e5/PVE/Storage/Plugin.pm#L424
-    # No need to check if name == 'local' anymore.
-    # The `pvesh` API output will always contain local storage properly.
-    # if name == 'local':
-    #    return StorageInfo.Dir(name)
-
     output = subprocess.check_output(['pvesh', 'get', '/storage', '--output-format=json-pretty'])
-    storages = json.loads(output)
-
-    for storage in storages:
-        if storage['storage'] != name:
+    for st in json.loads(output):
+        if st['storage'] != name:
             continue
-
-        # https://pve.proxmox.com/wiki/Storage#_common_storage_properties
-        content = storage['content'].split(',')
-        if 'images' not in content:
+        if 'images' not in st['content'].split(','):
             raise Exception(f'PVE storage {name} does not support VM images.')
-
-        # https://pve.proxmox.com/pve-docs/chapter-pvesm.html
-        typ = storage['type']
-        if typ in ['dir', 'nfs', 'glusterfs']:
+        t = st['type']
+        if t in ['dir','nfs','glusterfs']:
             return StorageInfo.Dir(name)
-        elif typ in ['zfspool', 'lvm', 'lvmthin']:
+        if t in ['zfspool','lvm','lvmthin']:
             return StorageInfo.Raw(name)
-        else:
-            raise Exception(f'Unsupported PVE storage type {typ}.')
-
+        raise Exception(f'Unsupported PVE storage type {t}.')
     raise Exception(f'PVE storage {name} does not exist.')
 
-
-def vm_exists(vmid: int):
-    return os.path.exists(f'/etc/pve/qemu-server/{vmid}.conf')
-
+def vm_exists_by_name(name: str) -> bool:
+    try:
+        out = subprocess.check_output(['qm','list'])
+    except subprocess.CalledProcessError:
+        return False
+    for line in out.decode().splitlines()[1:]:
+        cols = line.split()
+        if len(cols)>=2 and cols[1]==name:
+            return True
+    return False
 
 def build_customize_args(customize: dict) -> list:
-    if customize is None:
+    if not customize:
         return []
-
     args = []
-
-    for upload in customize.get('uploads', []):
-        args.extend(['--upload', upload])
-
-    for command in customize.get('commands', []):
-        args.extend(['--run-command', command])
-
+    for up in customize.get('uploads', []):
+        args += ['--upload', up]
+    for cmd in customize.get('commands', []):
+        args += ['--run-command', cmd]
     return args
 
+def import_template(template: dict, storage: StorageInfo.Base, vmid: int):
+    name = template['name']
+    url  = template['url']
 
-def import_template(template: dict, storage: StorageInfo.Base):
-    vmid, name, url = [template[k] for k in ('vmid', 'name', 'url')]
-
-    if vm_exists(vmid):
-        print(f'VM {vmid} exists, skipping.')
+    if vm_exists_by_name(name):
+        print(f'VM with name "{name}" exists, skipping.')
         return
 
-    print(f'Importing {vmid} ({name}) from {url}')
+    print(f'Importing VMID {vmid} ({name}) from {url}')
+    os.makedirs('./cloud_img', exist_ok=True)
+    dl = f'./cloud_img/{name}.img.download'
+    img = f'./cloud_img/{name}.img'
 
-    filename_dl = f'./cloud_img/{name}.img.download'
-    filename_img = f'./cloud_img/{name}.img'
-
-    # Delete and re-download the image
     with contextlib.suppress(FileNotFoundError):
-        os.remove(filename_dl)
-        os.remove(filename_img)
+        os.remove(dl); os.remove(img)
 
     with DownloadProgressBar(unit='B', unit_scale=True, miniters=1) as t:
-        urllib.request.urlretrieve(url, filename=filename_dl, reporthook=t.update_to)
+        urllib.request.urlretrieve(url, dl, reporthook=t.update_to)
 
-    unpack = template.get('unpack')
-    if unpack:
-        run(unpack.replace('{dl}', filename_dl).replace('{img}', filename_img))
+    if template.get('unpack'):
+        run(template['unpack'].replace('{dl}', dl).replace('{img}', img))
     else:
-        os.rename(filename_dl, filename_img)
+        os.rename(dl, img)
 
-    customize_args = build_customize_args(template.get('customize'))
-    if len(customize_args) != 0:
-        customize_cmd = ['virt-customize', '-a', filename_img, *customize_args]
-        # https://libguestfs.org/guestfs-faq.1.html#permission-denied-when-running-libguestfs-as-root
-        run(customize_cmd, LIBGUESTFS_BACKEND='direct')
+    cust_args = build_customize_args(template.get('customize'))
+    if cust_args:
+        run(['virt-customize','-a',img,*cust_args], LIBGUESTFS_BACKEND='direct')
 
-    # https://pve.proxmox.com/wiki/Cloud-Init_Support#_preparing_cloud_init_templates
     run(f'qm create {vmid} --name {name} --memory 512 --net0 virtio,bridge=vmbr0')
-    run(f'qm importdisk {vmid} {filename_img} {storage.name} -format qcow2')
+    run(f'qm importdisk {vmid} {img} {storage.name} -format qcow2')
 
     disk = storage.format_disk_name(vmid)
     run(f'qm set {vmid} --scsihw virtio-scsi-pci --scsi0 {storage.name}:{disk}')
     run(f'qm set {vmid} --boot c --bootdisk scsi0')
-
     run(f'qm set {vmid} --serial0 socket')
 
-    if template['cloud_init']:
+    if template.get('cloud_init'):
         run(f'qm set {vmid} --ide2 {storage.name}:cloudinit')
         run(f'qm set {vmid} --ciuser root')
 
     run(f'qm template {vmid}')
-
-    print(f'Deleting {filename_img}')
+    print(f'Deleting {img}')
     with contextlib.suppress(FileNotFoundError):
-        os.remove(filename_dl)
-        os.remove(filename_img)
-
-    print('Done')
-    print()
-
+        os.remove(img)
+    print('Done\n')
 
 def main():
+    # 检查依赖
     try:
-        subprocess.call(['virt-customize', '--version'], stdout=subprocess.DEVNULL)
-        subprocess.call(['unzip'], stdout=subprocess.DEVNULL)
+        subprocess.call(['virt-customize','--version'], stdout=subprocess.DEVNULL)
+        subprocess.call(['unzip'],          stdout=subprocess.DEVNULL)
     except FileNotFoundError:
         exit_missing_dep()
 
-    try:
-        storage_name = sys.argv[1]
-        storage_info = check_storage(storage_name)
-
-        vm_name = sys.argv[2] if len(sys.argv) > 2 else None
-    except IndexError:
-        print('Usage: python3 import.py <storage-name> [vm-name]')
-        print('If [vm-name] is specified, only the template with that name will be imported.')
+    if len(sys.argv) < 3:
+        print('Usage: python3 import.py <storage-name> <start-vmid> [template-name]')
         sys.exit(1)
 
-    os.makedirs("./cloud_img", exist_ok=True)
+    storage_name = sys.argv[1]
+    try:
+        start_vmid = int(sys.argv[2])
+    except ValueError:
+        print('Error: <start-vmid> must be an integer.')
+        sys.exit(1)
+    template_filter = sys.argv[3] if len(sys.argv)>3 else None
+
+    storage = check_storage(storage_name)
 
     with open('templates.yaml') as f:
-        templates = yaml.safe_load(f)
+        all_tpls = yaml.safe_load(f)['templates']
+    # 按名称过滤（若未指定则全量）
+    to_import = [t for t in all_tpls if template_filter is None or t['name']==template_filter]
 
-    for template in templates['templates']:
-        if vm_name is None or vm_name == template['name']:
-            import_template(template, storage_info)
-
+    for idx, tpl in enumerate(to_import):
+        import_template(tpl, storage, start_vmid + idx)
 
 if __name__ == '__main__':
     main()
