@@ -5,10 +5,21 @@ aliases:
     else printf "\nPermitRootLogin yes\n" >> /etc/ssh/sshd_config;
     fi
   - &command_install_qma_debian >-
-    apt-get update && apt-get install -y qemu-guest-agent && systemctl enable --now qemu-guest-agent
+    set -eux
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-guest-agent
+    update-rc.d qemu-guest-agent defaults || true
+    mkdir -p /etc/systemd/system/multi-user.target.wants
+    ln -sf /lib/systemd/system/qemu-guest-agent.service \
+           /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service
   - &command_install_qma_rhel >-
-    yum install -y qemu-guest-agent || dnf install -y qemu-guest-agent 
-    systemctl enable --now qemu-guest-agent
+    set -eux
+    if ! yum install -y qemu-guest-agent; then
+      dnf install -y qemu-guest-agent
+    fi
+    mkdir -p /etc/systemd/system/multi-user.target.wants
+    ln -sf /usr/lib/systemd/system/qemu-guest-agent.service \
+           /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service
 
 
 templates:
