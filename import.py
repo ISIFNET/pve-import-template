@@ -107,7 +107,7 @@ def import_template(template: dict, storage: StorageInfo.Base, vmid: int):
     if cust_args:
         run(['virt-customize','-a',img,*cust_args], LIBGUESTFS_BACKEND='direct')
 
-    run(f'qm create {vmid} --name {name} --memory 512 --net0 virtio,bridge=vmbr0')
+    run(f'qm create {vmid} --name {name} --memory 512 --net0 virtio,bridge=vmbr0,queues=4 --cpu host,flags=+aes')
     run(f'qm importdisk {vmid} {img} {storage.name} -format qcow2')
 
     disk = storage.format_disk_name(vmid)
