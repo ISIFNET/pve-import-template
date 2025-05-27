@@ -4,6 +4,12 @@ aliases:
     then sed -i -E 's/^(PermitRootLogin\s.*)+$/PermitRootLogin yes # \1/' /etc/ssh/sshd_config;
     else printf "\nPermitRootLogin yes\n" >> /etc/ssh/sshd_config;
     fi
+  - &command_install_qma_debian >-
+    apt-get update && apt-get install -y qemu-guest-agent && systemctl enable --now qemu-guest-agent
+  - &command_install_qma_rhel >-
+    yum install -y qemu-guest-agent || dnf install -y qemu-guest-agent 
+    systemctl enable --now qemu-guest-agent
+
 
 templates:
   - name: ubuntu-16.04
@@ -14,6 +20,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
+        - *command_install_qma_debian
 
   - name: ubuntu-18.04
     url: https://cloud-images.ubuntu.com/bionic/current/bionic-server-cloudimg-amd64.img
@@ -23,6 +30,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
+        - *command_install_qma_debian
 
   - name: ubuntu-20.04
     url: https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img
@@ -32,6 +40,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
+        - *command_install_qma_debian
 
   - name: ubuntu-22.04
     url: https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img
@@ -41,6 +50,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
+        - *command_install_qma_debian
 
   - name: ubuntu-24.10
     url: https://cloud-images.ubuntu.com/oracular/current/oracular-server-cloudimg-amd64.img
@@ -50,6 +60,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
+        - *command_install_qma_debian
 
   - name: debian-9
     url: https://cloud.debian.org/images/openstack/current-9/debian-9-openstack-amd64.qcow2
@@ -59,6 +70,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
+        - *command_install_qma_debian
 
   - name: debian-10
     url: https://cloud.debian.org/images/openstack/current-10/debian-10-openstack-amd64.qcow2
@@ -68,6 +80,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
+        - *command_install_qma_debian   
 
   - name: debian-11
     url: https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-genericcloud-amd64.qcow2
@@ -77,6 +90,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
+        - *command_install_qma_debian
 
   - name: debian-12
     url: https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2
@@ -86,6 +100,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
+        - *command_install_qma_debian
 
   - name: centos-8
     url: http://cloud.centos.org/centos/8/x86_64/images/CentOS-8-GenericCloud-8.4.2105-20210603.0.x86_64.qcow2
@@ -97,6 +112,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
+        - *command_install_qma_rhel
 
   - name: archLinux
     url: https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2
@@ -106,6 +122,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
+        - *command_install_qma_rhel
 
   - name: alpineLinux-3.21
     url: https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/cloud/generic_alpine-3.21.2-x86_64-bios-cloudinit-r0.qcow2
