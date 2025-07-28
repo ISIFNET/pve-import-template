@@ -188,7 +188,7 @@ templates:
         - *command_permit_root_login
 
   - name: almaLinux-9
-    url: https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-OpenNebula-9.6-20250522.x86_64.qcow2
+    url: https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-9.6-20250522.x86_64.qcow2
     cloud_init: true
     customize:
       uploads:
