@@ -20,6 +20,27 @@ aliases:
     mkdir -p /etc/systemd/system/multi-user.target.wants
     ln -sf /usr/lib/systemd/system/qemu-guest-agent.service \
            /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service
+  - &command_enable_bbr_optimized >-
+    set -eux
+    # 1) 加载 BBR 模块，开机自动加载
+    modprobe tcp_bbr
+    echo tcp_bbr >/etc/modules-load.d/bbr.conf
+
+    # 2) 持久化网络内核参数
+    cat <<EOF >/etc/sysctl.d/99-network-tuning.conf
+    net.core.default_qdisc = fq
+    net.ipv4.tcp_congestion_control = bbr
+
+    net.ipv4.tcp_syncookies = 1
+    net.ipv4.tcp_fin_timeout = 30
+    net.ipv4.tcp_tw_reuse = 1
+    net.ipv4.tcp_max_syn_backlog = 1024
+
+    net.ipv4.conf.all.arp_ignore = 1
+    net.ipv4.conf.all.arp_announce = 2
+    net.ipv4.conf.default.arp_ignore = 1
+    net.ipv4.conf.default.arp_announce = 2
+    EOF
 
 
 templates:
@@ -62,9 +83,10 @@ templates:
       commands:
         - *command_permit_root_login
         - *command_install_qma_debian
+        - *command_enable_bbr_optimized
 
-  - name: ubuntu-24.10
-    url: https://cloud-images.ubuntu.com/oracular/current/oracular-server-cloudimg-amd64.img
+  - name: ubuntu-24.04
+    url: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
     cloud_init: true
     customize:
       uploads:
@@ -72,6 +94,7 @@ templates:
       commands:
         - *command_permit_root_login
         - *command_install_qma_debian
+        - *command_enable_bbr_optimized
 
   - name: debian-9
     url: https://cloud.debian.org/images/openstack/current-9/debian-9-openstack-amd64.qcow2
@@ -91,7 +114,8 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma_debian   
+        - *command_install_qma_debian
+        - *command_enable_bbr_optimized
 
   - name: debian-11
     url: https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-genericcloud-amd64.qcow2
@@ -102,6 +126,7 @@ templates:
       commands:
         - *command_permit_root_login
         - *command_install_qma_debian
+        - *command_enable_bbr_optimized
 
   - name: debian-12
     url: https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2
@@ -112,6 +137,7 @@ templates:
       commands:
         - *command_permit_root_login
         - *command_install_qma_debian
+        - *command_enable_bbr_optimized
 
   - name: centos-8
     url: http://cloud.centos.org/centos/8/x86_64/images/CentOS-8-GenericCloud-8.4.2105-20210603.0.x86_64.qcow2
@@ -136,7 +162,15 @@ templates:
         - *command_install_qma_rhel
 
   - name: alpineLinux-3.21
-    url: https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/cloud/generic_alpine-3.21.2-x86_64-bios-cloudinit-r0.qcow2
+    url: https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/cloud/generic_alpine-3.21.4-x86_64-bios-cloudinit-r0.qcow2
+    cloud_init: true
+    customize:
+      uploads:
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
+      commands:
+        - *command_permit_root_login
+  - name: alpineLinux-3.22
+    url: https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/generic_alpine-3.22.1-x86_64-bios-cloudinit-r0.qcow2
     cloud_init: true
     customize:
       uploads:
@@ -155,6 +189,15 @@ templates:
 
   - name: almaLinux-9
     url: https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-OpenNebula-9.6-20250522.x86_64.qcow2
+    cloud_init: true
+    customize:
+      uploads:
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
+      commands:
+        - *command_permit_root_login
+
+  - name: almaLinux-10
+    url: https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2
     cloud_init: true
     customize:
       uploads:
