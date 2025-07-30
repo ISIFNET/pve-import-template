@@ -22,11 +22,7 @@ aliases:
            /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service
   - &command_enable_bbr_optimized >-
     set -eux
-    # 1) 加载 BBR 模块，开机自动加载
-    modprobe tcp_bbr
     echo tcp_bbr >/etc/modules-load.d/bbr.conf
-
-    # 2) 持久化网络内核参数
     cat <<EOF >/etc/sysctl.d/99-network-tuning.conf
     net.core.default_qdisc = fq
     net.ipv4.tcp_congestion_control = bbr
