@@ -4,34 +4,51 @@ aliases:
     then sed -i -E 's/^(PermitRootLogin\s.*)+$/PermitRootLogin yes # \1/' /etc/ssh/sshd_config;
     else printf "\nPermitRootLogin yes\n" >> /etc/ssh/sshd_config;
     fi
-  - &command_install_qma_debian >-
+  - &command_install_qma >-
     set -eux
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-guest-agent
-    update-rc.d qemu-guest-agent defaults || true
-    mkdir -p /etc/systemd/system/multi-user.target.wants
-    ln -sf /lib/systemd/system/qemu-guest-agent.service \
-           /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service
-  - &command_install_qma_rhel >-
-    set -eux
-    if ! yum install -y qemu-guest-agent; then
-      dnf install -y qemu-guest-agent
+    if command -v apt-get >/dev/null 2>&1; then
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y qemu-guest-agent
+      # chroot 里先不 systemctl enable；建 wants 目录以便兼容
+      mkdir -p /etc/systemd/system/multi-user.target.wants || true
+      ln -sf /lib/systemd/system/qemu-guest-agent.service \
+             /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service || true
+    
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf -y install qemu-guest-agent
+      mkdir -p /etc/systemd/system/multi-user.target.wants || true
+      ln -sf /usr/lib/systemd/system/qemu-guest-agent.service \
+             /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service || true
+    
+    elif command -v yum >/dev/null 2>&1; then
+      yum -y install qemu-guest-agent
+      mkdir -p /etc/systemd/system/multi-user.target.wants || true
+      ln -sf /usr/lib/systemd/system/qemu-guest-agent.service \
+             /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service || true
+    
+    elif command -v microdnf >/dev/null 2>&1; then
+      microdnf -y install qemu-guest-agent
+      mkdir -p /etc/systemd/system/multi-user.target.wants || true
+      ln -sf /usr/lib/systemd/system/qemu-guest-agent.service \
+             /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service || true
+    
+    else
+      echo "No supported package manager found on this image." >&2
+      exit 1
     fi
-    mkdir -p /etc/systemd/system/multi-user.target.wants
-    ln -sf /usr/lib/systemd/system/qemu-guest-agent.service \
-           /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service
   - &command_enable_bbr_optimized >-
     set -eux
     echo tcp_bbr >/etc/modules-load.d/bbr.conf
-    cat <<EOF >/etc/sysctl.d/99-network-tuning.conf
+    cat > /etc/sysctl.d/99-network-tuning.conf << "EOF"
     net.core.default_qdisc = fq
     net.ipv4.tcp_congestion_control = bbr
-
+    
     net.ipv4.tcp_syncookies = 1
     net.ipv4.tcp_fin_timeout = 30
     net.ipv4.tcp_tw_reuse = 1
     net.ipv4.tcp_max_syn_backlog = 1024
-
+    
     net.ipv4.conf.all.arp_ignore = 1
     net.ipv4.conf.all.arp_announce = 2
     net.ipv4.conf.default.arp_ignore = 1
@@ -48,7 +65,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma_debian
+        - *command_install_qma
 
   - name: ubuntu-18.04
     url: https://cloud-images.ubuntu.com/bionic/current/bionic-server-cloudimg-amd64.img
@@ -58,7 +75,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma_debian
+        - *command_install_qma
 
   - name: ubuntu-20.04
     url: https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img
@@ -68,7 +85,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma_debian
+        - *command_install_qma
 
   - name: ubuntu-22.04
     url: https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img
@@ -78,7 +95,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma_debian
+        - *command_install_qma
         - *command_enable_bbr_optimized
 
   - name: ubuntu-24.04
@@ -89,7 +106,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma_debian
+        - *command_install_qma
         - *command_enable_bbr_optimized
 
   - name: debian-9
@@ -100,7 +117,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma_debian
+        - *command_install_qma
 
   - name: debian-10
     url: https://cloud.debian.org/images/openstack/current-10/debian-10-openstack-amd64.qcow2
@@ -110,7 +127,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma_debian
+        - *command_install_qma
         - *command_enable_bbr_optimized
 
   - name: debian-11
@@ -121,7 +138,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma_debian
+        - *command_install_qma
         - *command_enable_bbr_optimized
 
   - name: debian-12
@@ -132,7 +149,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma_debian
+        - *command_install_qma
         - *command_enable_bbr_optimized
         
   - name: debian-13
@@ -143,7 +160,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma_debian
+        - *command_install_qma
         - *command_enable_bbr_optimized
 
   - name: centos-8
@@ -156,7 +173,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma_rhel
+        - *command_install_qma
 
   - name: archLinux
     url: https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2
@@ -166,7 +183,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma_rhel
+        - *command_install_qma
 
   - name: alpineLinux-3.21
     url: https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/cloud/generic_alpine-3.21.4-x86_64-bios-cloudinit-r0.qcow2
