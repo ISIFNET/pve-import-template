@@ -6,37 +6,50 @@ aliases:
     fi
   - &command_install_qma >-
     set -eux
-    if command -v apt-get >/dev/null 2>&1; then
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update
-      apt-get install -y qemu-guest-agent
-      # chroot 里先不 systemctl enable；建 wants 目录以便兼容
-      mkdir -p /etc/systemd/system/multi-user.target.wants || true
-      ln -sf /lib/systemd/system/qemu-guest-agent.service \
-             /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service || true
-    
-    elif command -v dnf >/dev/null 2>&1; then
-      dnf -y install qemu-guest-agent
-      mkdir -p /etc/systemd/system/multi-user.target.wants || true
-      ln -sf /usr/lib/systemd/system/qemu-guest-agent.service \
-             /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service || true
-    
-    elif command -v yum >/dev/null 2>&1; then
-      yum -y install qemu-guest-agent
-      mkdir -p /etc/systemd/system/multi-user.target.wants || true
-      ln -sf /usr/lib/systemd/system/qemu-guest-agent.service \
-             /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service || true
-    
-    elif command -v microdnf >/dev/null 2>&1; then
-      microdnf -y install qemu-guest-agent
-      mkdir -p /etc/systemd/system/multi-user.target.wants || true
-      ln -sf /usr/lib/systemd/system/qemu-guest-agent.service \
-             /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service || true
-    
-    else
-      echo "No supported package manager found on this image." >&2
-      exit 1
+    # 不要在 chroot 中用 systemctl / update-rc.d，直接创建 wants 链接即可
+    mkdir -p /etc/systemd/system/multi-user.target.wants || true
+    install_qga() {
+      if command -v apt-get >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -y || true
+        # 减少体积和触发器
+        apt-get install -y --no-install-recommends qemu-guest-agent || return 1
+        ln -sf /lib/systemd/system/qemu-guest-agent.service \
+               /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service || true
+        return 0
+      elif command -v dnf >/dev/null 2>&1; then
+        dnf -y install qemu-guest-agent || return 1
+        ln -sf /usr/lib/systemd/system/qemu-guest-agent.service \
+               /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service || true
+        return 0
+      elif command -v yum >/dev/null 2>&1; then
+        yum -y install qemu-guest-agent || return 1
+        ln -sf /usr/lib/systemd/system/qemu-guest-agent.service \
+               /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service || true
+        return 0
+      elif command -v microdnf >/dev/null 2>&1; then
+        microdnf -y install qemu-guest-agent || return 1
+        ln -sf /usr/lib/systemd/system/qemu-guest-agent.service \
+               /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service || true
+        return 0
+      elif command -v zypper >/dev/null 2>&1; then
+        zypper --non-interactive install -y qemu-guest-agent || return 1
+        ln -sf /usr/lib/systemd/system/qemu-guest-agent.service \
+               /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service || true
+        return 0
+      elif command -v pacman >/dev/null 2>&1; then
+        pacman -Sy --noconfirm qemu-guest-agent || return 1
+        ln -sf /usr/lib/systemd/system/qemu-guest-agent.service \
+               /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service || true
+        return 0
+      fi
+      return 2
+    }
+    # 不让 virt-customize 因安装失败而中止：失败只发出警告，最终 exit 0
+    if ! install_qga; then
+      echo "[WARN] qemu-guest-agent not installed (no supported package manager or repo unreachable)." >&2
     fi
+    exit 0
   - &command_enable_bbr_optimized >-
     set -eux
     echo tcp_bbr >/etc/modules-load.d/bbr.conf
