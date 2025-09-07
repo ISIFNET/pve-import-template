@@ -1,133 +1,118 @@
 aliases:
   - &command_permit_root_login >-
-    if grep -E '^PermitRootLogin\s';
+    if grep -E '^PermitRootLogin\s' /etc/ssh/sshd_config >/dev/null 2>&1;
     then sed -i -E 's/^(PermitRootLogin\s.*)+$/PermitRootLogin yes # \1/' /etc/ssh/sshd_config;
     else printf "\nPermitRootLogin yes\n" >> /etc/ssh/sshd_config;
     fi
-- &command_install_qga >-
-  #!/bin/sh
-  # 安装并启用 qemu-guest-agent（适配 Debian/Ubuntu EOL、RHEL/CentOS、openSUSE、Arch）
-  # 设计目标：不论是否安装成功，整段都以 0 退出，避免中断 virt-customize
-  set -u
 
-  ok=0
+  - &command_install_qga |
+    #!/bin/sh
+    # 安装并启用 qemu-guest-agent（适配 Debian/Ubuntu EOL、RHEL/CentOS、openSUSE、Arch）
+    # 目标：即使装不到也不会让 virt-customize 失败；最后必须 exit 0
+    set -u
 
-  fix_debian_eol_sources() {
-    # 将 deb.debian.org / security.debian.org 切到 archive，并关闭 Valid-Until
-    mkdir -p /etc/apt/apt.conf.d || true
-    printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99ignore-valid-until || true
-    if [ -f /etc/os-release ]; then
+    ok=0
+
+    fix_debian_eol_sources() {
+      # 切到 archive.debian.org，并关闭 Valid-Until 校验
+      mkdir -p /etc/apt/apt.conf.d || true
+      printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99ignore-valid-until || true
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+        [ -f "$f" ] || continue
+        sed -i -E 's@https?://deb\.debian\.org/debian@http://archive.debian.org/debian@g' "$f" || true
+        sed -i -E 's@https?://security\.debian\.org/debian-security@http://archive.debian.org/debian-security@g' "$f" || true
+        sed -i -E '/stretch-updates/d' "$f" || true
+      done
+    }
+
+    fix_ubuntu_eol_sources() {
+      # Ubuntu EOL → old-releases.ubuntu.com
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+        [ -f "$f" ] || continue
+        sed -i -E 's@https?://([a-z0-9.-]+\.)?ubuntu\.com/?ubuntu@http://old-releases.ubuntu.com/ubuntu@g' "$f" || true
+        sed -i -E 's@https?://security\.ubuntu\.com/ubuntu@http://old-releases.ubuntu.com/ubuntu@g' "$f" || true
+      done
+    }
+
+    enable_systemd_wants_link() {
+      # 不跑 systemctl；仅放 wants 链接，首启自然拉起
+      mkdir -p /etc/systemd/system/multi-user.target.wants || true
+      if   [ -e /lib/systemd/system/qemu-guest-agent.service ]; then
+        ln -sf /lib/systemd/system/qemu-guest-agent.service \
+               /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service || true
+      elif [ -e /usr/lib/systemd/system/qemu-guest-agent.service ]; then
+        ln -sf /usr/lib/systemd/system/qemu-guest-agent.service \
+               /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service || true
+      fi
+    }
+
+    # --- APT 系（Debian/Ubuntu） ---
+    if command -v apt-get >/dev/null 2>&1; then
+      export DEBIAN_FRONTEND=noninteractive
       . /etc/os-release 2>/dev/null || true
-    fi
-    codename="${VERSION_CODENAME:-$(grep -oE 'VERSION=.*\(([^)]+)\)' /etc/os-release 2>/dev/null | sed -E 's/.*\(([^)]+)\).*/\1/')}"
+      low_id="$(printf '%s' "${ID:-}" | tr '[:upper:]' '[:lower:]')"
+      case ",$low_id," in
+        *,debian,*) fix_debian_eol_sources ;;
+        *,ubuntu,*) fix_ubuntu_eol_sources ;;
+        *) : ;;
+      esac
 
-    # 兜底替换：把所有 deb.debian.org / security.debian.org 都换成 archive
-    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
-      [ -f "$f" ] || continue
-      sed -i -E 's@http(s)?://(deb|security)\.debian\.org@http://archive.debian.org@g' "$f" || true
-      # stretch-updates 早已关闭，直接删掉相关行
-      sed -i -E '/stretch-updates/d' "$f" || true
-    done
-  }
-
-  fix_ubuntu_eol_sources() {
-    # Ubuntu EOL -> old-releases.ubuntu.com
-    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
-      [ -f "$f" ] || continue
-      sed -i -E 's@http(s)?://([a-z0-9.-]+\.)?ubuntu\.com/?ubuntu@http://old-releases.ubuntu.com/ubuntu@g' "$f" || true
-      sed -i -E 's@http(s)?://security\.ubuntu\.com/ubuntu@http://old-releases.ubuntu.com/ubuntu@g' "$f" || true
-    done
-  }
-
-  enable_systemd_wants_link() {
-    # 不跑 systemctl；仅放置 wants 链接，让首启时 systemd 自然拉起
-    mkdir -p /etc/systemd/system/multi-user.target.wants || true
-    if   [ -e /lib/systemd/system/qemu-guest-agent.service ]; then
-      ln -sf /lib/systemd/system/qemu-guest-agent.service \
-             /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service || true
-    elif [ -e /usr/lib/systemd/system/qemu-guest-agent.service ]; then
-      ln -sf /usr/lib/systemd/system/qemu-guest-agent.service \
-             /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service || true
-    fi
-  }
-
-  # --- APT 系（Debian/Ubuntu） ---
-  if command -v apt-get >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-
-    # 粗略识别发行版以决定是否切换到归档源
-    if [ -f /etc/os-release ]; then
-      . /etc/os-release 2>/dev/null || true
-      id_like="$(printf '%s' "${ID_LIKE:-}" | tr '[:upper:]' '[:lower:]')"
-      id="$(printf '%s' "${ID:-}" | tr '[:upper:]' '[:lower:]')"
-    else
-      id_like=""; id=""
+      apt-get -o Acquire::Check-Valid-Until=false update || true
+      if apt-get install -y --no-install-recommends qemu-guest-agent; then
+        ok=1
+      fi
+      enable_systemd_wants_link
     fi
 
-    case ",$id,$id_like," in
-      *,debian,*|*,debian,*) fix_debian_eol_sources ;;
-      *,ubuntu,*|*,ubuntu,*) fix_ubuntu_eol_sources ;;
-      *) : ;;
-    esac
-
-    # 更新索引（忽略 Valid-Until）
-    apt-get -o Acquire::Check-Valid-Until=false update || true
-    # 尝试安装 qga
-    if apt-get install -y --no-install-recommends qemu-guest-agent; then
-      ok=1
+    # --- DNF / YUM 系（RHEL/CentOS/Alma/Rocky 等） ---
+    if [ "$ok" -eq 0 ] && command -v dnf >/dev/null 2>&1; then
+      dnf -y install qemu-guest-agent && ok=1 || true
+      enable_systemd_wants_link
     fi
-    enable_systemd_wants_link
-  fi
+    if [ "$ok" -eq 0 ] && command -v yum >/dev/null 2>&1; then
+      yum -y install qemu-guest-agent && ok=1 || true
+      enable_systemd_wants_link
+    fi
+    if [ "$ok" -eq 0 ] && command -v microdnf >/dev/null 2>&1; then
+      microdnf -y install qemu-guest-agent && ok=1 || true
+      enable_systemd_wants_link
+    fi
 
-  # --- DNF / YUM 系（RHEL/CentOS/Alma/Rocky 等） ---
-  if [ "$ok" -eq 0 ] && command -v dnf >/dev/null 2>&1; then
-    dnf -y install qemu-guest-agent && ok=1 || true
-    enable_systemd_wants_link
-  fi
-  if [ "$ok" -eq 0 ] && command -v yum >/dev/null 2>&1; then
-    yum -y install qemu-guest-agent && ok=1 || true
-    enable_systemd_wants_link
-  fi
-  if [ "$ok" -eq 0 ] && command -v microdnf >/dev/null 2>&1; then
-    microdnf -y install qemu-guest-agent && ok=1 || true
-    enable_systemd_wants_link
-  fi
+    # --- openSUSE ---
+    if [ "$ok" -eq 0 ] && command -v zypper >/dev/null 2>&1; then
+      zypper --non-interactive install -y qemu-guest-agent && ok=1 || true
+      enable_systemd_wants_link
+    fi
 
-  # --- openSUSE ---
-  if [ "$ok" -eq 0 ] && command -v zypper >/dev/null 2>&1; then
-    zypper --non-interactive install -y qemu-guest-agent && ok=1 || true
-    enable_systemd_wants_link
-  fi
+    # --- Arch ---
+    if [ "$ok" -eq 0 ] && command -v pacman >/dev/null 2>&1; then
+      pacman -Sy --noconfirm qemu-guest-agent && ok=1 || true
+      enable_systemd_wants_link
+    fi
 
-  # --- Arch ---
-  if [ "$ok" -eq 0 ] && command -v pacman >/dev/null 2>&1; then
-    pacman -Sy --noconfirm qemu-guest-agent && ok=1 || true
-    enable_systemd_wants_link
-  fi
+    if [ "$ok" -eq 0 ]; then
+      echo "[WARN] qemu-guest-agent not installed (pkg manager absent or repos unavailable). Skipping." >&2
+    fi
 
-  if [ "$ok" -eq 0 ]; then
-    echo "[WARN] qemu-guest-agent not installed (no supported pkg manager or repos unavailable). Skipping." >&2
-  fi
+    exit 0
 
-  exit 0
   - &command_enable_bbr_optimized >-
     set -eux
     echo tcp_bbr >/etc/modules-load.d/bbr.conf
     cat > /etc/sysctl.d/99-network-tuning.conf << "EOF"
     net.core.default_qdisc = fq
     net.ipv4.tcp_congestion_control = bbr
-    
+
     net.ipv4.tcp_syncookies = 1
     net.ipv4.tcp_fin_timeout = 30
     net.ipv4.tcp_tw_reuse = 1
     net.ipv4.tcp_max_syn_backlog = 1024
-    
+
     net.ipv4.conf.all.arp_ignore = 1
     net.ipv4.conf.all.arp_announce = 2
     net.ipv4.conf.default.arp_ignore = 1
     net.ipv4.conf.default.arp_announce = 2
     EOF
-
 
 templates:
   - name: ubuntu-16.04
@@ -138,7 +123,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma
+        - *command_install_qga
 
   - name: ubuntu-18.04
     url: https://cloud-images.ubuntu.com/bionic/current/bionic-server-cloudimg-amd64.img
@@ -148,7 +133,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma
+        - *command_install_qga
 
   - name: ubuntu-20.04
     url: https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img
@@ -158,7 +143,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma
+        - *command_install_qga
 
   - name: ubuntu-22.04
     url: https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img
@@ -168,7 +153,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma
+        - *command_install_qga
         - *command_enable_bbr_optimized
 
   - name: ubuntu-24.04
@@ -179,7 +164,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma
+        - *command_install_qga
         - *command_enable_bbr_optimized
 
   - name: debian-9
@@ -190,7 +175,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma
+        - *command_install_qga
 
   - name: debian-10
     url: https://cloud.debian.org/images/openstack/current-10/debian-10-openstack-amd64.qcow2
@@ -200,7 +185,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma
+        - *command_install_qga
         - *command_enable_bbr_optimized
 
   - name: debian-11
@@ -211,7 +196,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma
+        - *command_install_qga
         - *command_enable_bbr_optimized
 
   - name: debian-12
@@ -222,9 +207,9 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma
+        - *command_install_qga
         - *command_enable_bbr_optimized
-        
+
   - name: debian-13
     url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
     cloud_init: true
@@ -233,7 +218,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma
+        - *command_install_qga
         - *command_enable_bbr_optimized
 
   - name: centos-8
@@ -241,12 +226,11 @@ templates:
     cloud_init: true
     customize:
       uploads:
-        # 同上
-        - /dev/null:/etc/resolv.conf
+        - /dev/null:/etc/resolv.conf   # 防止某些镜像 resolv.conf 不可写
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma
+        - *command_install_qga
 
   - name: archLinux
     url: https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2
@@ -256,7 +240,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
-        - *command_install_qma
+        - *command_install_qga
 
   - name: alpineLinux-3.21
     url: https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/cloud/generic_alpine-3.21.4-x86_64-bios-cloudinit-r0.qcow2
@@ -265,7 +249,8 @@ templates:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
-        - *command_permit_root_login
+        - *command_permit_root_login  # apk 未覆盖，暂不尝试安装 qga
+
   - name: alpineLinux-3.22
     url: https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/generic_alpine-3.22.1-x86_64-bios-cloudinit-r0.qcow2
     cloud_init: true
@@ -273,7 +258,7 @@ templates:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
-        - *command_permit_root_login
+        - *command_permit_root_login  # apk 未覆盖，暂不尝试安装 qga
 
   - name: almaLinux-8
     url: https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/AlmaLinux-8-GenericCloud-latest.x86_64.qcow2
@@ -283,6 +268,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
+        - *command_install_qga
 
   - name: almaLinux-9
     url: https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-9.6-20250522.x86_64.qcow2
@@ -292,6 +278,7 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
+        - *command_install_qga
 
   - name: almaLinux-10
     url: https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2
@@ -301,3 +288,4 @@ templates:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
       commands:
         - *command_permit_root_login
+        - *command_install_qga
