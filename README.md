@@ -2,16 +2,6 @@
 
 自动化导入 Cloud-init 镜像到 Proxmox VE 的工具。支持 Ubuntu、Debian、CentOS Stream、Arch Linux、Alpine Linux、AlmaLinux 等主流发行版。
 
-## 功能特性
-
-- ✅ **智能缓存**：对比 ETag/Last-Modified，镜像未变化时跳过下载
-- ✅ **选择性导入**：支持通配符（`ubuntu-*`）或逗号分隔的模板列表
-- ✅ **仅导入新模板**：`--only-new` 选项跳过已存在的 VM
-- ✅ **强制刷新**：`--refresh` 选项忽略缓存，重新下载镜像
-- ✅ **离线定制**：使用 virt-customize 预配置 SSH、qemu-guest-agent、网络优化等
-- ✅ **自动安装 qemu-guest-agent**：支持 Debian/Ubuntu/RHEL/CentOS/openSUSE/Arch，包括 EOL 版本
-- ✅ **网络优化**：部分模板预配置 TCP BBR 拥塞控制和其他网络调优参数
-
 ## 快速开始
 
 ### 一键安装（推荐）
