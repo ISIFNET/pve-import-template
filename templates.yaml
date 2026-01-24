@@ -114,6 +114,83 @@ aliases:
     net.ipv4.conf.default.arp_announce = 2
     EOF
 
+# 镜像源配置 - 用于内网环境
+# 使用方法：python3 import.py local-lvm 900 --mirror aliyun
+mirrors:
+  # 阿里云镜像源
+  aliyun:
+    ubuntu:
+      url: http://mirrors.aliyun.com/ubuntu
+    debian:
+      url: http://mirrors.aliyun.com/debian
+    rhel:
+      url: http://mirrors.aliyun.com/centos
+    alpine:
+      url: http://mirrors.aliyun.com/alpine
+    arch:
+      url: http://mirrors.aliyun.com/archlinux
+
+  # 清华大学镜像源
+  tsinghua:
+    ubuntu:
+      url: https://mirrors.tuna.tsinghua.edu.cn/ubuntu
+    debian:
+      url: https://mirrors.tuna.tsinghua.edu.cn/debian
+    rhel:
+      url: https://mirrors.tuna.tsinghua.edu.cn/centos
+    alpine:
+      url: https://mirrors.tuna.tsinghua.edu.cn/alpine
+    arch:
+      url: https://mirrors.tuna.tsinghua.edu.cn/archlinux
+
+  # 华为云镜像源
+  huawei:
+    ubuntu:
+      url: https://repo.huaweicloud.com/ubuntu
+    debian:
+      url: https://repo.huaweicloud.com/debian
+    rhel:
+      url: https://repo.huaweicloud.com/centos
+    alpine:
+      url: https://repo.huaweicloud.com/alpine
+    arch:
+      url: https://repo.huaweicloud.com/archlinux
+
+  # 腾讯云镜像源
+  tencent:
+    ubuntu:
+      url: http://mirrors.cloud.tencent.com/ubuntu
+    debian:
+      url: http://mirrors.cloud.tencent.com/debian
+    rhel:
+      url: http://mirrors.cloud.tencent.com/centos
+    alpine:
+      url: http://mirrors.cloud.tencent.com/alpine
+    arch:
+      url: http://mirrors.cloud.tencent.com/archlinux
+
+  # 中科大镜像源
+  ustc:
+    ubuntu:
+      url: https://mirrors.ustc.edu.cn/ubuntu
+    debian:
+      url: https://mirrors.ustc.edu.cn/debian
+    rhel:
+      url: https://mirrors.ustc.edu.cn/centos
+    alpine:
+      url: https://mirrors.ustc.edu.cn/alpine
+    arch:
+      url: https://mirrors.ustc.edu.cn/archlinux
+
+  # 内网示例 - 可自定义为您的内网镜像服务器
+  # internal:
+  #   ubuntu:
+  #     url: http://your-internal-mirror.local/ubuntu
+  #   debian:
+  #     url: http://your-internal-mirror.local/debian
+  #   rhel:
+  #     url: http://your-internal-mirror.local/centos
+
 templates:
   - name: ubuntu-18.04
     url: https://cloud-images.ubuntu.com/bionic/current/bionic-server-cloudimg-amd64.img

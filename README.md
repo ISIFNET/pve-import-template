@@ -48,6 +48,7 @@ python3 import.py <storage-name> <start-vmid> [template-name] [选项]
 
 - `--only-new`：只导入 PVE 中尚不存在的模板
 - `--refresh`：强制刷新，忽略缓存重新下载镜像
+- `--mirror <name>`：使用指定的镜像源（适用于内网环境）
 
 ### 使用示例
 
@@ -78,9 +79,22 @@ python3 import.py local-lvm 900 'almaLinux-*'
 python3 import.py local-lvm 900 ubuntu-22.04 --refresh
 ```
 
+**使用内网镜像源：**
+```bash
+# 使用阿里云镜像源
+python3 import.py local-lvm 900 --mirror aliyun
+
+# 使用清华大学镜像源
+python3 import.py local-lvm 900 --mirror tsinghua
+
+# 导入 Ubuntu 系列模板并使用华为云镜像源
+python3 import.py local-lvm 900 'ubuntu-*' --mirror huawei
+```
+
 **组合使用选项：**
 ```bash
 python3 import.py local-lvm 900 'ubuntu-*' --only-new
+python3 import.py local-lvm 900 'ubuntu-*' --only-new --mirror aliyun
 ```
 
 ## 支持的模板
@@ -144,6 +158,62 @@ Alpine Linux 3.23 模板包含预配置的 DNS 服务器（1.1.1.1 和 8.8.8.8�
 
 配置文件：`/etc/sysctl.d/99-network-tuning.conf`
 
+## 镜像源配置（内网环境）
+
+对于网络受限的内网环境，可以使用 `--mirror` 参数指定镜像源，在导入模板时自动配置软件包源。
+
+### 内置镜像源
+
+工具内置了以下国内镜像源：
+
+| 名称 | 说明 |
+|------|------|
+| `aliyun` | 阿里云镜像源 |
+| `tsinghua` | 清华大学镜像源 |
+| `huawei` | 华为云镜像源 |
+| `tencent` | 腾讯云镜像源 |
+| `ustc` | 中国科学技术大学镜像源 |
+
+### 使用方法
+
+```bash
+# 使用阿里云镜像源导入所有模板
+python3 import.py local-lvm 900 --mirror aliyun
+
+# 使用清华镜像源导入 Ubuntu 模板
+python3 import.py local-lvm 900 'ubuntu-*' --mirror tsinghua
+```
+
+### 自定义镜像源
+
+您可以在 `templates.yaml` 中的 `mirrors` 部分添加自定义镜像源：
+
+```yaml
+mirrors:
+  # 自定义内网镜像源
+  internal:
+    ubuntu:
+      url: http://your-internal-mirror.local/ubuntu
+    debian:
+      url: http://your-internal-mirror.local/debian
+    rhel:
+      url: http://your-internal-mirror.local/centos
+    alpine:
+      url: http://your-internal-mirror.local/alpine
+    arch:
+      url: http://your-internal-mirror.local/archlinux
+```
+
+### 支持的操作系统
+
+镜像源配置支持以下操作系统类型：
+
+- **Ubuntu**：自动替换 `archive.ubuntu.com` 和 `security.ubuntu.com`
+- **Debian**：自动替换 `deb.debian.org` 和 `security.debian.org`
+- **RHEL/CentOS/AlmaLinux**：自动配置 yum/dnf 仓库
+- **Alpine Linux**：自动替换 `dl-cdn.alpinelinux.org`
+- **Arch Linux**：自动配置 pacman mirrorlist
+
 ## 支持的存储类型
 
 - **目录类型**：dir、nfs、glusterfs
@@ -160,6 +230,13 @@ Alpine Linux 3.23 模板包含预配置的 DNS 服务器（1.1.1.1 和 8.8.8.8�
 - `customize`：定制配置
   - `uploads`：上传文件到镜像
   - `commands`：在镜像中执行的命令
+
+## 清除存在的VM
+
+for vmid in $(qm list | awk '$1 >= 9000 && $1 <= 9999 {print $1}'); do
+  echo "Destroying VM $vmid"
+  qm destroy $vmid --purge
+done
 
 ## 许可证
 

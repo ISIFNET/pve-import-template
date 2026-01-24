@@ -12,9 +12,10 @@ import.py - Proxmox VE Cloud Image Importer
 - 保留原有 cloud-init 选项设置
 - 默认保留下载好的镜像文件；--refresh 可强制重下并覆盖缓存
 - 所有外部命令失败会抛出异常（更快发现问题）
+- 支持自定义镜像源：--mirror <mirror-name> 可为内网环境配置软件源
 
 用法
-  python3 import.py <storage-name> <start-vmid> [template-name[,name2|glob]] [--only-new] [--refresh]
+  python3 import.py <storage-name> <start-vmid> [template-name[,name2|glob]] [--only-new] [--refresh] [--mirror <mirror-name>]
 
 示例
   # 全部导入（从 900 开始编号）
@@ -31,6 +32,12 @@ import.py - Proxmox VE Cloud Image Importer
 
   # 强制刷新镜像（无视缓存，重新下载）
   python3 import.py local-lvm 900 ubuntu-22.04 --refresh
+
+  # 使用内网镜像源（在 templates.yaml 的 mirrors 中配置）
+  python3 import.py local-lvm 900 --mirror aliyun
+
+  # 组合使用：导入 ubuntu 系列模板，使用清华镜像源
+  python3 import.py local-lvm 900 'ubuntu-*' --mirror tsinghua
 """
 
 import sys
@@ -40,6 +47,7 @@ import urllib.request
 import subprocess
 import json
 import fnmatch
+import tempfile
 from typing import Iterable, Tuple, Optional
 
 try:
@@ -144,6 +152,169 @@ def build_customize_args(customize: Optional[dict]) -> list:
     for cmd in customize.get('commands', []):
         args += ['--run-command', cmd]
     return args
+
+
+def detect_os_family(template_name: str) -> Optional[str]:
+    """
+    根据模板名称检测操作系统类型。
+    返回：'debian', 'ubuntu', 'rhel', 'arch', 'alpine', 'suse' 或 None
+    """
+    name_lower = template_name.lower()
+    if 'ubuntu' in name_lower:
+        return 'ubuntu'
+    if 'debian' in name_lower:
+        return 'debian'
+    if any(x in name_lower for x in ['centos', 'alma', 'rocky', 'rhel', 'fedora']):
+        return 'rhel'
+    if 'arch' in name_lower:
+        return 'arch'
+    if 'alpine' in name_lower:
+        return 'alpine'
+    if any(x in name_lower for x in ['suse', 'opensuse']):
+        return 'suse'
+    return None
+
+
+def build_mirror_command(mirror_config: dict, os_family: str) -> Optional[str]:
+    """
+    根据镜像源配置和操作系统类型，生成配置镜像源的 shell 命令。
+    """
+    if not mirror_config or not os_family:
+        return None
+
+    # 检查该镜像源是否支持此操作系统
+    if os_family not in mirror_config:
+        return None
+
+    os_mirror = mirror_config[os_family]
+    base_url = os_mirror.get('url', '')
+
+    if not base_url:
+        return None
+
+    # 根据不同的操作系统生成不同的配置命令
+    if os_family == 'ubuntu':
+        return f'''#!/bin/sh
+set -eu
+# 配置 Ubuntu 镜像源
+if [ -f /etc/apt/sources.list ]; then
+    cp /etc/apt/sources.list /etc/apt/sources.list.bak
+    sed -i -E 's@https?://([a-z0-9.-]+\\.)?archive\\.ubuntu\\.com/ubuntu@{base_url}@g' /etc/apt/sources.list
+    sed -i -E 's@https?://([a-z0-9.-]+\\.)?security\\.ubuntu\\.com/ubuntu@{base_url}@g' /etc/apt/sources.list
+fi
+# Ubuntu 24.04+ 使用 deb822 格式
+if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+    cp /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.bak
+    sed -i -E 's@https?://([a-z0-9.-]+\\.)?archive\\.ubuntu\\.com/ubuntu@{base_url}@g' /etc/apt/sources.list.d/ubuntu.sources
+    sed -i -E 's@https?://([a-z0-9.-]+\\.)?security\\.ubuntu\\.com/ubuntu@{base_url}@g' /etc/apt/sources.list.d/ubuntu.sources
+fi
+exit 0
+'''
+
+    elif os_family == 'debian':
+        return f'''#!/bin/sh
+set -eu
+# 配置 Debian 镜像源
+if [ -f /etc/apt/sources.list ]; then
+    cp /etc/apt/sources.list /etc/apt/sources.list.bak
+    sed -i -E 's@https?://deb\\.debian\\.org@{base_url}@g' /etc/apt/sources.list
+    sed -i -E 's@https?://security\\.debian\\.org@{base_url}@g' /etc/apt/sources.list
+fi
+# Debian 12+ 可能使用 deb822 格式
+if [ -f /etc/apt/sources.list.d/debian.sources ]; then
+    cp /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list.d/debian.sources.bak
+    sed -i -E 's@https?://deb\\.debian\\.org@{base_url}@g' /etc/apt/sources.list.d/debian.sources
+    sed -i -E 's@https?://security\\.debian\\.org@{base_url}@g' /etc/apt/sources.list.d/debian.sources
+fi
+exit 0
+'''
+
+    elif os_family == 'rhel':
+        # RHEL 系（CentOS/AlmaLinux/Rocky）使用 baseurl 替换
+        return f'''#!/bin/sh
+set -eu
+# 配置 RHEL/CentOS 系镜像源
+for repo in /etc/yum.repos.d/*.repo; do
+    [ -f "$repo" ] || continue
+    cp "$repo" "$repo.bak"
+    # 注释掉 mirrorlist，启用 baseurl
+    sed -i 's/^mirrorlist=/#mirrorlist=/g' "$repo"
+    sed -i 's/^#baseurl=/baseurl=/g' "$repo"
+    # 替换 baseurl
+    sed -i -E 's@https?://mirror\\.centos\\.org@{base_url}@g' "$repo"
+    sed -i -E 's@https?://vault\\.centos\\.org@{base_url}@g' "$repo"
+    sed -i -E 's@https?://repo\\.almalinux\\.org@{base_url}@g' "$repo"
+    sed -i -E 's@https?://mirror\\.rockylinux\\.org@{base_url}@g' "$repo"
+done
+exit 0
+'''
+
+    elif os_family == 'alpine':
+        return f'''#!/bin/sh
+set -eu
+# 配置 Alpine 镜像源
+if [ -f /etc/apk/repositories ]; then
+    cp /etc/apk/repositories /etc/apk/repositories.bak
+    sed -i -E 's@https?://dl-cdn\\.alpinelinux\\.org/alpine@{base_url}@g' /etc/apk/repositories
+fi
+exit 0
+'''
+
+    elif os_family == 'arch':
+        return f'''#!/bin/sh
+set -eu
+# 配置 Arch Linux 镜像源
+if [ -f /etc/pacman.d/mirrorlist ]; then
+    cp /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist.bak
+    echo "Server = {base_url}/\\$repo/os/\\$arch" > /etc/pacman.d/mirrorlist
+fi
+exit 0
+'''
+
+    elif os_family == 'suse':
+        return f'''#!/bin/sh
+set -eu
+# 配置 openSUSE 镜像源
+zypper mr --disable --all 2>/dev/null || true
+zypper ar -fcg {base_url}/distribution/leap/\\$releasever/repo/oss/ mirror-oss 2>/dev/null || true
+zypper ar -fcg {base_url}/update/leap/\\$releasever/oss/ mirror-update 2>/dev/null || true
+exit 0
+'''
+
+    return None
+
+
+def build_mirror_args(mirror_config: Optional[dict], template_name: str) -> list:
+    """
+    根据镜像源配置生成 virt-customize 参数。
+    返回额外的 virt-customize 参数列表。
+    """
+    if not mirror_config:
+        return []
+
+    os_family = detect_os_family(template_name)
+    if not os_family:
+        print(f'Warning: Cannot detect OS family for {template_name}, skipping mirror configuration.')
+        return []
+
+    mirror_cmd = build_mirror_command(mirror_config, os_family)
+    if not mirror_cmd:
+        print(f'Warning: Mirror not configured for OS family "{os_family}", skipping.')
+        return []
+
+    # 创建临时脚本文件
+    script_fd, script_path = tempfile.mkstemp(prefix='mirror_setup_', suffix='.sh')
+    try:
+        with os.fdopen(script_fd, 'w') as f:
+            f.write(mirror_cmd)
+        os.chmod(script_path, 0o755)
+        return ['--run', script_path, '--delete', script_path]
+    except Exception as e:
+        print(f'Warning: Failed to create mirror script: {e}')
+        with contextlib.suppress(Exception):
+            os.close(script_fd)
+            os.remove(script_path)
+        return []
 
 
 def http_head(url: str) -> Tuple[Optional[str], Optional[str]]:
@@ -253,7 +424,7 @@ def match_templates(all_tpls: list, filter_expr: Optional[str]) -> list:
     return uniq
 
 
-def import_template(template: dict, storage: StorageInfo.Base, vmid: int, keep_image: bool = True, refresh: bool = False):
+def import_template(template: dict, storage: StorageInfo.Base, vmid: int, keep_image: bool = True, refresh: bool = False, mirror_config: Optional[dict] = None):
     name = template['name']
     url  = template['url']
 
@@ -266,10 +437,14 @@ def import_template(template: dict, storage: StorageInfo.Base, vmid: int, keep_i
     unpack = template.get('unpack')  # 例如：'unzip -p {dl} > {img}'
     img = download_with_cache(name, url, unpack_cmd=unpack, refresh=refresh)
 
+    # 构建 virt-customize 参数：先配置镜像源，再执行其他自定义命令
+    mirror_args = build_mirror_args(mirror_config, name)
     cust_args = build_customize_args(template.get('customize'))
-    if cust_args:
+    all_cust_args = mirror_args + cust_args
+
+    if all_cust_args:
         # 使用 direct 后端，避免某些宿主限制导致失败
-        run(['virt-customize', '-a', img, *cust_args], LIBGUESTFS_BACKEND='direct')
+        run(['virt-customize', '-a', img, *all_cust_args], LIBGUESTFS_BACKEND='direct')
 
     # 创建 VM 并导入磁盘
     run(f'qm create {vmid} --name {name} --memory 512 --net0 virtio,bridge=vmbr0,queues=4 --cpu host,flags=+aes')
@@ -307,7 +482,7 @@ def main():
         sys.exit(2)
 
     if len(sys.argv) < 3:
-        print('Usage: python3 import.py <storage-name> <start-vmid> [template-name[,name2|glob]] [--only-new] [--refresh]')
+        print('Usage: python3 import.py <storage-name> <start-vmid> [template-name[,name2|glob]] [--only-new] [--refresh] [--mirror <mirror-name>]')
         sys.exit(1)
 
     storage_name = sys.argv[1]
@@ -321,18 +496,42 @@ def main():
     template_filter = None
     only_new = False
     refresh = False
-    for arg in sys.argv[3:]:
+    mirror_name = None
+    args = sys.argv[3:]
+    i = 0
+    while i < len(args):
+        arg = args[i]
         if arg == '--only-new':
             only_new = True
         elif arg == '--refresh':
             refresh = True
+        elif arg == '--mirror':
+            if i + 1 < len(args):
+                mirror_name = args[i + 1]
+                i += 1
+            else:
+                print('Error: --mirror requires a mirror name.')
+                sys.exit(1)
         elif not arg.startswith('-'):
             template_filter = arg
+        i += 1
 
     storage = check_storage(storage_name)
 
     with open('templates.yaml', 'r', encoding='utf-8') as f:
-        all_tpls = yaml.safe_load(f)['templates']
+        config = yaml.safe_load(f)
+        all_tpls = config['templates']
+        mirrors = config.get('mirrors', {})
+
+    # 获取镜像源配置
+    mirror_config = None
+    if mirror_name:
+        if mirror_name not in mirrors:
+            print(f'Error: Mirror "{mirror_name}" not found in templates.yaml.')
+            print(f'Available mirrors: {", ".join(mirrors.keys()) if mirrors else "(none)"}')
+            sys.exit(1)
+        mirror_config = mirrors[mirror_name]
+        print(f'Using mirror: {mirror_name}')
 
     to_import_all = match_templates(all_tpls, template_filter)
     if only_new:
@@ -345,7 +544,8 @@ def main():
             storage,
             start_vmid + idx,
             keep_image=not refresh,
-            refresh=refresh
+            refresh=refresh,
+            mirror_config=mirror_config
         )
 
 
