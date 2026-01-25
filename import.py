@@ -215,16 +215,37 @@ exit 0
         return f'''#!/bin/sh
 set -eu
 # 配置 Debian 镜像源
+
+# 方法1: 传统 sources.list 格式 (Debian 10/11)
 if [ -f /etc/apt/sources.list ]; then
     cp /etc/apt/sources.list /etc/apt/sources.list.bak
     sed -i -E 's@https?://deb\\.debian\\.org@{base_url}@g' /etc/apt/sources.list
     sed -i -E 's@https?://security\\.debian\\.org@{base_url}@g' /etc/apt/sources.list
 fi
-# Debian 12+ 可能使用 deb822 格式
+
+# 方法2: DEB822 格式 (Debian 12+)
 if [ -f /etc/apt/sources.list.d/debian.sources ]; then
     cp /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list.d/debian.sources.bak
     sed -i -E 's@https?://deb\\.debian\\.org@{base_url}@g' /etc/apt/sources.list.d/debian.sources
     sed -i -E 's@https?://security\\.debian\\.org@{base_url}@g' /etc/apt/sources.list.d/debian.sources
+fi
+
+# 方法3: 镜像重定向列表 (Debian 12/13 cloud image 使用)
+# 这些文件被 sources 中的 mirror+file 引用
+if [ -d /etc/apt/mirrors ]; then
+    for mirror_file in /etc/apt/mirrors/*.list; do
+        [ -f "$mirror_file" ] || continue
+        cp "$mirror_file" "$mirror_file.bak"
+        # 直接将内容替换为新的镜像源地址
+        case "$mirror_file" in
+            *debian-security.list)
+                echo "{base_url}/debian-security" > "$mirror_file"
+                ;;
+            *debian.list)
+                echo "{base_url}/debian" > "$mirror_file"
+                ;;
+        esac
+    done
 fi
 exit 0
 '''
