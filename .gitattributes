@@ -1,0 +1,15 @@
+# 统一行尾为 LF，避免不同编辑器/平台引入 CRLF 噪声
+* text=auto eol=lf
+
+# 脚本与代码强制 LF（CRLF 会破坏 guest 内 shebang / virt-customize --run）
+*.sh    text eol=lf
+*.py    text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.cfg   text eol=lf
+*.conf  text eol=lf
+*.md    text eol=lf
+
+# 二进制：不做行尾转换
+*.img   binary
+*.qcow2 binary
