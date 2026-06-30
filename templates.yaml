@@ -1,118 +1,14 @@
-aliases:
-  - &command_permit_root_login >-
-    if grep -E '^PermitRootLogin\s' /etc/ssh/sshd_config >/dev/null 2>&1;
-    then sed -i -E 's/^(PermitRootLogin\s.*)+$/PermitRootLogin yes # \1/' /etc/ssh/sshd_config;
-    else printf "\nPermitRootLogin yes\n" >> /etc/ssh/sshd_config;
-    fi
-
-  - &command_install_qga |
-    #!/bin/sh
-    # 安装并启用 qemu-guest-agent（适配 Debian/Ubuntu EOL、RHEL/CentOS、openSUSE、Arch）
-    # 目标：即使装不到也不会让 virt-customize 失败；最后必须 exit 0
-    set -u
-
-    ok=0
-
-    fix_debian_eol_sources() {
-      # 切到 archive.debian.org，并关闭 Valid-Until 校验
-      mkdir -p /etc/apt/apt.conf.d || true
-      printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99ignore-valid-until || true
-      for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
-        [ -f "$f" ] || continue
-        sed -i -E 's@https?://deb\.debian\.org/debian@http://archive.debian.org/debian@g' "$f" || true
-        sed -i -E 's@https?://security\.debian\.org/debian-security@http://archive.debian.org/debian-security@g' "$f" || true
-        sed -i -E '/stretch-updates/d' "$f" || true
-      done
-    }
-
-    fix_ubuntu_eol_sources() {
-      # Ubuntu EOL → old-releases.ubuntu.com
-      for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
-        [ -f "$f" ] || continue
-        sed -i -E 's@https?://([a-z0-9.-]+\.)?ubuntu\.com/?ubuntu@http://old-releases.ubuntu.com/ubuntu@g' "$f" || true
-        sed -i -E 's@https?://security\.ubuntu\.com/ubuntu@http://old-releases.ubuntu.com/ubuntu@g' "$f" || true
-      done
-    }
-
-    enable_systemd_wants_link() {
-      # 不跑 systemctl；仅放 wants 链接，首启自然拉起
-      mkdir -p /etc/systemd/system/multi-user.target.wants || true
-      if   [ -e /lib/systemd/system/qemu-guest-agent.service ]; then
-        ln -sf /lib/systemd/system/qemu-guest-agent.service \
-               /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service || true
-      elif [ -e /usr/lib/systemd/system/qemu-guest-agent.service ]; then
-        ln -sf /usr/lib/systemd/system/qemu-guest-agent.service \
-               /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service || true
-      fi
-    }
-
-    # --- APT 系（Debian/Ubuntu） ---
-    if command -v apt-get >/dev/null 2>&1; then
-      export DEBIAN_FRONTEND=noninteractive
-      . /etc/os-release 2>/dev/null || true
-      low_id="$(printf '%s' "${ID:-}" | tr '[:upper:]' '[:lower:]')"
-      case ",$low_id," in
-        *,debian,*) fix_debian_eol_sources ;;
-        *,ubuntu,*) fix_ubuntu_eol_sources ;;
-        *) : ;;
-      esac
-
-      apt-get -o Acquire::Check-Valid-Until=false update || true
-      if apt-get install -y --no-install-recommends qemu-guest-agent; then
-        ok=1
-      fi
-      enable_systemd_wants_link
-    fi
-
-    # --- DNF / YUM 系（RHEL/CentOS/Alma/Rocky 等） ---
-    if [ "$ok" -eq 0 ] && command -v dnf >/dev/null 2>&1; then
-      dnf -y install qemu-guest-agent && ok=1 || true
-      enable_systemd_wants_link
-    fi
-    if [ "$ok" -eq 0 ] && command -v yum >/dev/null 2>&1; then
-      yum -y install qemu-guest-agent && ok=1 || true
-      enable_systemd_wants_link
-    fi
-    if [ "$ok" -eq 0 ] && command -v microdnf >/dev/null 2>&1; then
-      microdnf -y install qemu-guest-agent && ok=1 || true
-      enable_systemd_wants_link
-    fi
-
-    # --- openSUSE ---
-    if [ "$ok" -eq 0 ] && command -v zypper >/dev/null 2>&1; then
-      zypper --non-interactive install -y qemu-guest-agent && ok=1 || true
-      enable_systemd_wants_link
-    fi
-
-    # --- Arch ---
-    if [ "$ok" -eq 0 ] && command -v pacman >/dev/null 2>&1; then
-      pacman -Sy --noconfirm qemu-guest-agent && ok=1 || true
-      enable_systemd_wants_link
-    fi
-
-    if [ "$ok" -eq 0 ]; then
-      echo "[WARN] qemu-guest-agent not installed (pkg manager absent or repos unavailable). Skipping." >&2
-    fi
-
-    exit 0
-
-  - &command_enable_bbr_optimized >-
-    set -eux
-    echo tcp_bbr >/etc/modules-load.d/bbr.conf
-    cat > /etc/sysctl.d/99-network-tuning.conf << "EOF"
-    net.core.default_qdisc = fq
-    net.ipv4.tcp_congestion_control = bbr
-
-    net.ipv4.tcp_syncookies = 1
-    net.ipv4.tcp_fin_timeout = 30
-    net.ipv4.tcp_tw_reuse = 1
-    net.ipv4.tcp_max_syn_backlog = 1024
-
-    net.ipv4.conf.all.arp_ignore = 1
-    net.ipv4.conf.all.arp_announce = 2
-    net.ipv4.conf.default.arp_ignore = 1
-    net.ipv4.conf.default.arp_announce = 2
-    EOF
+# templates.yaml —— pve-import-template 配置
+#
+# 设计说明
+# - 镜像内的定制动作统一使用「可复用脚本」：customize.run 列表中的脚本（位于 ./uploads/）
+#   会被 import.py 与 update-templates.py 共用，避免逻辑重复、便于维护。
+#   * ./uploads/permit-root-login.sh   允许 root SSH 登录
+#   * ./uploads/install-qga.sh         安装并启用 qemu-guest-agent（多发行版自适应）
+#   * ./uploads/apply-net-tuning.sh    BBR + 网络/内核 sysctl 调优（由 import.py 默认注入，无需在此声明）
+# - 网络/内核调优默认对所有模板开启；如某发行版不适用，可在该模板下加 net_tuning: false；
+#   也可在命令行用 --no-tuning 全局关闭。
+# - customize 支持的键：uploads（--upload）、run（--run 脚本文件）、commands（--run-command 内联命令）。
 
 # 镜像源配置 - 用于内网环境
 # 使用方法：python3 import.py local-lvm 900 --mirror aliyun
@@ -192,15 +88,16 @@ mirrors:
   #     url: http://your-internal-mirror.local/centos
 
 templates:
+  # ===== Ubuntu =====
   - name: ubuntu-18.04
     url: https://cloud-images.ubuntu.com/bionic/current/bionic-server-cloudimg-amd64.img
     cloud_init: true
     customize:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      commands:
-        - *command_permit_root_login
-        - *command_install_qga
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
 
   - name: ubuntu-20.04
     url: https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img
@@ -208,9 +105,9 @@ templates:
     customize:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      commands:
-        - *command_permit_root_login
-        - *command_install_qga
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
 
   - name: ubuntu-22.04
     url: https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img
@@ -218,10 +115,9 @@ templates:
     customize:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      commands:
-        - *command_permit_root_login
-        - *command_install_qga
-        - *command_enable_bbr_optimized
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
 
   - name: ubuntu-24.04
     url: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
@@ -229,21 +125,30 @@ templates:
     customize:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      commands:
-        - *command_permit_root_login
-        - *command_install_qga
-        - *command_enable_bbr_optimized
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
 
+  - name: ubuntu-26.04
+    url: https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img
+    cloud_init: true
+    customize:
+      uploads:
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
+
+  # ===== Debian =====
   - name: debian-10
     url: https://cloud.debian.org/images/openstack/current-10/debian-10-openstack-amd64.qcow2
     cloud_init: true
     customize:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      commands:
-        - *command_permit_root_login
-        - *command_install_qga
-        - *command_enable_bbr_optimized
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
 
   - name: debian-11
     url: https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-genericcloud-amd64.qcow2
@@ -251,10 +156,9 @@ templates:
     customize:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      commands:
-        - *command_permit_root_login
-        - *command_install_qga
-        - *command_enable_bbr_optimized
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
 
   - name: debian-12
     url: https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2
@@ -262,10 +166,9 @@ templates:
     customize:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      commands:
-        - *command_permit_root_login
-        - *command_install_qga
-        - *command_enable_bbr_optimized
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
 
   - name: debian-13
     url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
@@ -273,30 +176,20 @@ templates:
     customize:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      commands:
-        - *command_permit_root_login
-        - *command_install_qga
-        - *command_enable_bbr_optimized
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
 
-  - name: centos-stream-8
-    url: https://cloud.centos.org/centos/8-stream/x86_64/images/CentOS-Stream-GenericCloud-8-latest.x86_64.qcow2
-    cloud_init: true
-    customize:
-      uploads:
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      commands:
-        - *command_permit_root_login
-        - *command_install_qga
-
+  # ===== CentOS Stream =====
   - name: centos-stream-9
     url: https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2
     cloud_init: true
     customize:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      commands:
-        - *command_permit_root_login
-        - *command_install_qga
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
 
   - name: centos-stream-10
     url: https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-x86_64-10-latest.x86_64.qcow2
@@ -304,49 +197,62 @@ templates:
     customize:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      commands:
-        - *command_permit_root_login
-        - *command_install_qga
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
 
-  - name: archLinux
-    url: https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2
+  # centos-stream-8 已于 2024-05-31 EOL，镜像随时可能下线；如需可自行取消注释。
+  # - name: centos-stream-8
+  #   url: https://cloud.centos.org/centos/8-stream/x86_64/images/CentOS-Stream-GenericCloud-8-latest.x86_64.qcow2
+  #   cloud_init: true
+  #   customize:
+  #     uploads:
+  #       - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
+  #     run:
+  #       - ./uploads/permit-root-login.sh
+  #       - ./uploads/install-qga.sh
+
+  # ===== Rocky Linux =====
+  - name: rocky-8
+    url: https://dl.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-GenericCloud.latest.x86_64.qcow2
     cloud_init: true
     customize:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      commands:
-        - *command_permit_root_login
-        - *command_install_qga
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
 
-  - name: alpineLinux-3.22
-    url: https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/generic_alpine-3.22.1-x86_64-bios-cloudinit-r0.qcow2
+  - name: rocky-9
+    url: https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud.latest.x86_64.qcow2
     cloud_init: true
     customize:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-        - ./uploads/resolv.conf:/etc/resolv.conf
-      commands:
-        - *command_permit_root_login  # apk 未覆盖，暂不尝试安装 qga
-        
-  - name: alpineLinux-3.23
-    url: https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/generic_alpine-3.23.2-x86_64-bios-cloudinit-r0.qcow2
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
+
+  - name: rocky-10
+    url: https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud.latest.x86_64.qcow2
     cloud_init: true
     customize:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-        - ./uploads/resolv.conf:/etc/resolv.conf
-      commands:
-        - *command_permit_root_login  # apk 未覆盖，暂不尝试安装 qga
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
 
+  # ===== AlmaLinux =====
   - name: almaLinux-8
     url: https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/AlmaLinux-8-GenericCloud-latest.x86_64.qcow2
     cloud_init: true
     customize:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      commands:
-        - *command_permit_root_login
-        - *command_install_qga
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
 
   - name: almaLinux-9
     url: https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2
@@ -354,9 +260,9 @@ templates:
     customize:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      commands:
-        - *command_permit_root_login
-        - *command_install_qga
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
 
   - name: almaLinux-10
     url: https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2
@@ -364,6 +270,77 @@ templates:
     customize:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      commands:
-        - *command_permit_root_login
-        - *command_install_qga
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
+
+  # ===== Fedora Cloud =====
+  # Fedora 构建号会随点版本变化（无 -latest 软链），如失效请更新为当前构建号。
+  - name: fedora-42
+    url: https://download.fedoraproject.org/pub/fedora/linux/releases/42/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-42-1.1.x86_64.qcow2
+    cloud_init: true
+    customize:
+      uploads:
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
+
+  - name: fedora-43
+    url: https://download.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2
+    cloud_init: true
+    customize:
+      uploads:
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
+
+  # ===== openSUSE Leap =====
+  - name: opensuse-leap-15.6
+    url: https://download.opensuse.org/distribution/leap/15.6/appliances/openSUSE-Leap-15.6-Minimal-VM.x86_64-Cloud.qcow2
+    cloud_init: true
+    customize:
+      uploads:
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
+
+  # ===== Arch Linux =====
+  - name: archLinux
+    url: https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2
+    cloud_init: true
+    customize:
+      uploads:
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
+
+  # ===== Alpine Linux =====
+  # Alpine 为 musl/openrc 极简镜像：模块加载与 sysctl 行为不同，默认不注入网络调优（net_tuning: false）。
+  # qga 通过 apk + openrc 安装（install-qga.sh 已适配）。
+  - name: alpineLinux-3.22
+    url: https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/generic_alpine-3.22.1-x86_64-bios-cloudinit-r0.qcow2
+    cloud_init: true
+    net_tuning: false
+    customize:
+      uploads:
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
+        - ./uploads/resolv.conf:/etc/resolv.conf
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
+
+  - name: alpineLinux-3.23
+    url: https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/generic_alpine-3.23.2-x86_64-bios-cloudinit-r0.qcow2
+    cloud_init: true
+    net_tuning: false
+    customize:
+      uploads:
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
+        - ./uploads/resolv.conf:/etc/resolv.conf
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh

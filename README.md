@@ -1,36 +1,34 @@
 # pve-import-template
 
-自动化导入 Cloud-init 镜像到 Proxmox VE 的工具。支持 Ubuntu、Debian、CentOS Stream、Arch Linux、Alpine Linux、AlmaLinux 等主流发行版。
+自动化导入 Cloud-init 镜像到 Proxmox VE 的工具。支持 Ubuntu、Debian、CentOS Stream、Rocky Linux、AlmaLinux、Fedora、openSUSE、Arch Linux、Alpine Linux 等主流发行版。
+
+包含两个工具：
+
+- **`import.py`** —— 下载云镜像、离线定制、创建并转换为 PVE 模板。
+- **`update-templates.py`** —— 对**已经导入**的模板就地重新应用定制（网络调优 / qemu-guest-agent / 允许 root 登录等），**无需重新下载或重建模板**。
+
+> 变更历史见 [CHANGELOG.md](./CHANGELOG.md)。
 
 ## 快速开始
 
 ### 一键安装（推荐）
 
-使用 wget：
 ```bash
 wget -O - https://raw.githubusercontent.com/ISIFNET/pve-import-template/refs/heads/master/run.sh | bash
-```
-
-或使用 curl：
-```bash
+# 或
 curl https://raw.githubusercontent.com/ISIFNET/pve-import-template/refs/heads/master/run.sh | bash
 ```
 
 ### 手动安装
 
-1. 安装 git 并克隆仓库：
 ```bash
 apt install -y git
 git clone https://github.com/ISIFNET/pve-import-template
 cd pve-import-template
+./setup.sh          # 添加 no-subscription 源并安装依赖
 ```
 
-2. 安装依赖（添加 no-subscription 源并安装所需软件包）：
-```bash
-./setup.sh
-```
-
-## 使用方法
+## import.py —— 导入模板
 
 ### 基本语法
 
@@ -38,159 +36,141 @@ cd pve-import-template
 python3 import.py <storage-name> <start-vmid> [template-name] [选项]
 ```
 
-**参数说明：**
-- `<storage-name>`：PVE 存储名称（如 `local-lvm`、`local`、`zfs-pool` 等）
+- `<storage-name>`：PVE 存储名称（如 `local-lvm`、`local`、`zfs-pool`）
 - `<start-vmid>`：起始 VM ID，例如 900
-- `[template-name]`：可选，指定要导入的模板（支持逗号分隔或通配符）
-- `[选项]`：可选参数，见下方说明
+- `[template-name]`：可选，指定模板（支持逗号分隔或通配符）
 
-### 选项说明
+### 选项
 
-- `--only-new`：只导入 PVE 中尚不存在的模板
-- `--refresh`：强制刷新，忽略缓存重新下载镜像
-- `--mirror <name>`：使用指定的镜像源（适用于内网环境）
+| 选项 | 说明 |
+|------|------|
+| `--only-new` | 只导入 PVE 中尚不存在的模板 |
+| `--refresh` | 忽略缓存，强制重新下载镜像 |
+| `--mirror <name>` | 使用 `templates.yaml` 中配置的镜像源（内网环境） |
+| `--no-tuning` | 本次导入不注入网络/内核 sysctl 调优（默认开启） |
+| `--list` | 列出所有可用模板与镜像源后退出 |
+| `-h, --help` | 显示帮助 |
 
 ### 使用示例
 
-**导入所有模板（从 VMID 900 开始）：**
 ```bash
-python3 import.py local-lvm 900
-```
-
-**只导入不存在的模板：**
-```bash
-python3 import.py local-lvm 900 --only-new
-```
-
-**导入指定的多个模板：**
-```bash
-python3 import.py local-lvm 900 ubuntu-22.04,ubuntu-20.04
-```
-
-**使用通配符导入一批模板：**
-```bash
-python3 import.py local-lvm 900 'ubuntu-*'
-python3 import.py local-lvm 900 'debian-*'
-python3 import.py local-lvm 900 'almaLinux-*'
-```
-
-**强制刷新指定模板：**
-```bash
+python3 import.py --list                                   # 查看可用模板
+python3 import.py local-lvm 900                            # 导入全部（从 900 开始）
+python3 import.py local-lvm 900 --only-new                 # 只导入还不存在的
+python3 import.py local-lvm 900 ubuntu-22.04,ubuntu-20.04  # 指定多个
+python3 import.py local-lvm 900 'ubuntu-*' --mirror tsinghua
 python3 import.py local-lvm 900 ubuntu-22.04 --refresh
+python3 import.py local-lvm 900 'rocky-*' --no-tuning
 ```
 
-**使用内网镜像源：**
+### 导入时的 VM 默认配置
+
+- `--cpu host,flags=+aes`、`--ostype l26`
+- `--agent enabled=1,fstrim_cloned_disks=1`（启用 QEMU Guest Agent，克隆后自动 fstrim）
+- 系统盘 `virtio-scsi-single` + `discard=on,ssd=1`（支持 TRIM/精简回收）
+- `--net0 virtio,bridge=vmbr0,queues=4`、`--serial0 socket`
+- 启用 cloud-init 时：挂载 cloudinit 盘、`--ciuser root`、`--ipconfig0 ip=dhcp`
+
+## update-templates.py —— 更新已导入的模板
+
+给**已经存在**的模板补充或更新设置，直接对模板系统盘运行 `virt-customize`，不重下镜像、不改 VMID。
+
 ```bash
-# 使用阿里云镜像源
-python3 import.py local-lvm 900 --mirror aliyun
-
-# 使用清华大学镜像源
-python3 import.py local-lvm 900 --mirror tsinghua
-
-# 导入 Ubuntu 系列模板并使用华为云镜像源
-python3 import.py local-lvm 900 'ubuntu-*' --mirror huawei
+python3 update-templates.py [选择器 ...] [动作] [选项]
 ```
 
-**组合使用选项：**
+**选择器**：`<vmid>` / `<name>` / 通配 `'ubuntu-*'` / `--all`（所有模板）
+
+**动作**（不指定动作时默认仅「网络调优」）：
+
+| 动作 | 说明 |
+|------|------|
+| `--tuning` / `--no-tuning` | 应用 / 不应用网络/内核调优（默认应用） |
+| `--qga` | 安装并启用 qemu-guest-agent |
+| `--permit-root` | 允许 root SSH 登录 |
+| `--run <script>` | 运行任意宿主机脚本（可重复） |
+
+**选项**：`--vms`（允许选中已停止的普通 VM）、`--dry-run`（预演）、`-y/--yes`（跳过确认）、`--list`、`-h/--help`
+
+### 示例
+
 ```bash
-python3 import.py local-lvm 900 'ubuntu-*' --only-new
-python3 import.py local-lvm 900 'ubuntu-*' --only-new --mirror aliyun
+python3 update-templates.py --list                     # 列出模板及其系统盘
+python3 update-templates.py --all --dry-run            # 预演：对所有模板应用网络调优
+python3 update-templates.py --all                      # 给所有模板补网络调优
+python3 update-templates.py --all --qga --permit-root  # 同时补 qga + 允许 root
+python3 update-templates.py 'ubuntu-*' --no-tuning --qga
+python3 update-templates.py 9000 9001 -y
 ```
+
+> ⚠ `virt-customize` 会**就地**修改模板系统盘。若该模板已被**链接克隆（linked clone，常见于 lvmthin/zfs）**，
+> 修改基卷可能影响这些克隆，请谨慎并建议先备份/快照。`--qga` 等联网安装动作要求宿主机可访问软件源。
 
 ## 支持的模板
 
-### Ubuntu
-- ubuntu-18.04（Bionic Beaver）
-- ubuntu-20.04（Focal Fossa）
-- ubuntu-22.04（Jammy Jellyfish）
-- ubuntu-24.04（Noble Numbat）
+| 系列 | 模板 |
+|------|------|
+| Ubuntu | ubuntu-18.04 / 20.04 / 22.04 / 24.04 / **26.04** |
+| Debian | debian-10 / 11 / 12 / 13 |
+| CentOS Stream | centos-stream-9 / 10（stream-8 已 EOL，默认注释） |
+| Rocky Linux | **rocky-8 / 9 / 10** |
+| AlmaLinux | almaLinux-8 / 9 / 10 |
+| Fedora | **fedora-42 / 43** |
+| openSUSE | **opensuse-leap-15.6** |
+| 其他 | archLinux、alpineLinux-3.22 / 3.23 |
 
-### Debian
-- debian-10（Buster）
-- debian-11（Bullseye）
-- debian-12（Bookworm）
-- debian-13（Trixie）
+`python3 import.py --list` 可查看当前 `templates.yaml` 中的全部模板。
 
-### CentOS Stream
-- centos-stream-8
-- centos-stream-9
-- centos-stream-10
+## 内置定制行为
 
-### AlmaLinux
-- almaLinux-8
-- almaLinux-9
-- almaLinux-10
+镜像内的定制统一由 `uploads/` 下的可复用脚本完成（`import.py` 与 `update-templates.py` 共用，单一数据源）：
 
-### 其他发行版
-- archLinux
-- alpineLinux-3.22
-- alpineLinux-3.23
+### 允许 root 登录（`permit-root-login.sh`）
 
-## 特殊配置
+所有模板默认允许 root 登录并启用密码认证（配合 `uploads/ssh.cfg`），便于初始化。
 
-### Alpine Linux DNS 配置
+### qemu-guest-agent（`install-qga.sh`）
 
-Alpine Linux 3.23 模板包含预配置的 DNS 服务器（1.1.1.1 和 8.8.8.8），以解决默认 DNS 注入问题。配置文件位于 `uploads/resolv.conf`。
+自动适配多发行版：Debian/Ubuntu（含 EOL，自动切 archive 源）、RHEL/CentOS/Rocky/Alma（dnf/yum/microdnf）、
+openSUSE（zypper）、Arch（pacman）、**Alpine（apk + openrc）**。安装失败不会中断导入。
 
-### SSH 配置
+### 网络/内核调优（`apply-net-tuning.sh`，**默认对所有模板开启**）
 
-所有模板都预配置了以下 SSH 设置（通过 `uploads/ssh.cfg`）：
-- 允许 root 登录
-- 支持密码认证（用于初始化配置）
+写入 `/etc/sysctl.d/99-network-tuning.conf` 与 `/etc/modules-load.d/bbr.conf`，开机生效；不支持的内核参数会被自动忽略：
 
-### qemu-guest-agent
+```ini
+net.core.default_qdisc = fq
+net.core.rmem_max = 67108848
+net.core.wmem_max = 67108848
+net.core.somaxconn = 4096
+net.ipv4.tcp_max_syn_backlog = 4096
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_rmem = 16384 16777216 536870912
+net.ipv4.tcp_wmem = 16384 16777216 536870912
+net.ipv4.tcp_adv_win_scale = -2
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_timestamps = 1
+kernel.panic = -1
+vm.swappiness = 0
+```
 
-脚本会自动尝试安装 qemu-guest-agent，支持：
-- Debian/Ubuntu（包括 EOL 版本，自动切换到 archive 源）
-- RHEL/CentOS/AlmaLinux/Rocky（dnf/yum/microdnf）
-- openSUSE（zypper）
-- Arch Linux（pacman）
+**按发行版差异**：Alpine（musl/openrc，模块加载与 sysctl 行为不同）默认**不**注入调优（`net_tuning: false`）。
+- 关闭单个模板：在该模板下加 `net_tuning: false`
+- 全局关闭：`--no-tuning`
 
-安装失败不会中断导入流程，确保兼容性。
+### Alpine DNS
 
-### 网络优化
-
-部分模板（Ubuntu 22.04+、Debian 10+）预配置了：
-- TCP BBR 拥塞控制算法
-- TCP SYN cookies 保护
-- ARP 防欺骗配置
-- 其他网络调优参数
-
-配置文件：`/etc/sysctl.d/99-network-tuning.conf`
+Alpine 模板上传预置 DNS（`uploads/resolv.conf`，1.1.1.1 / 8.8.8.8），解决默认 DNS 注入问题。
 
 ## 镜像源配置（内网环境）
 
-对于网络受限的内网环境，可以使用 `--mirror` 参数指定镜像源，在导入模板时自动配置软件包源。
+`--mirror <name>` 可在导入时自动换源。内置：`aliyun`、`tsinghua`、`huawei`、`tencent`、`ustc`。
+支持的系统：Ubuntu、Debian、RHEL/CentOS/Rocky/Alma、Alpine、Arch（openSUSE/Fedora 暂未提供专用源映射，使用时会跳过换源）。
 
-### 内置镜像源
-
-工具内置了以下国内镜像源：
-
-| 名称 | 说明 |
-|------|------|
-| `aliyun` | 阿里云镜像源 |
-| `tsinghua` | 清华大学镜像源 |
-| `huawei` | 华为云镜像源 |
-| `tencent` | 腾讯云镜像源 |
-| `ustc` | 中国科学技术大学镜像源 |
-
-### 使用方法
-
-```bash
-# 使用阿里云镜像源导入所有模板
-python3 import.py local-lvm 900 --mirror aliyun
-
-# 使用清华镜像源导入 Ubuntu 模板
-python3 import.py local-lvm 900 'ubuntu-*' --mirror tsinghua
-```
-
-### 自定义镜像源
-
-您可以在 `templates.yaml` 中的 `mirrors` 部分添加自定义镜像源：
+可在 `templates.yaml` 的 `mirrors` 段添加自定义内网源：
 
 ```yaml
 mirrors:
-  # 自定义内网镜像源
   internal:
     ubuntu:
       url: http://your-internal-mirror.local/ubuntu
@@ -198,45 +178,35 @@ mirrors:
       url: http://your-internal-mirror.local/debian
     rhel:
       url: http://your-internal-mirror.local/centos
-    alpine:
-      url: http://your-internal-mirror.local/alpine
-    arch:
-      url: http://your-internal-mirror.local/archlinux
 ```
-
-### 支持的操作系统
-
-镜像源配置支持以下操作系统类型：
-
-- **Ubuntu**：自动替换 `archive.ubuntu.com` 和 `security.ubuntu.com`
-- **Debian**：自动替换 `deb.debian.org` 和 `security.debian.org`
-- **RHEL/CentOS/AlmaLinux**：自动配置 yum/dnf 仓库
-- **Alpine Linux**：自动替换 `dl-cdn.alpinelinux.org`
-- **Arch Linux**：自动配置 pacman mirrorlist
 
 ## 支持的存储类型
 
-- **目录类型**：dir、nfs、glusterfs
-- **块设备类型**：zfspool、lvm、lvmthin
+- 目录类型：dir、nfs、glusterfs
+- 块设备类型：zfspool、lvm、lvmthin
 
 ## 自定义模板
 
-您可以编辑 `templates.yaml` 来添加或修改模板配置。模板配置支持：
+编辑 `templates.yaml`，每个模板支持：
 
 - `name`：模板名称
 - `url`：镜像下载地址
 - `cloud_init`：是否启用 cloud-init
+- `net_tuning`：是否注入网络/内核调优（默认 `true`，设 `false` 关闭）
 - `unpack`：解压命令（支持 `{dl}` 和 `{img}` 占位符）
-- `customize`：定制配置
-  - `uploads`：上传文件到镜像
-  - `commands`：在镜像中执行的命令
+- `customize`：
+  - `uploads`：上传文件到镜像（`--upload`）
+  - `run`：在镜像内执行宿主机脚本文件（`--run`，相对路径基于脚本目录）
+  - `commands`：在镜像内执行的内联命令（`--run-command`）
 
-## 清除存在的VM
+## 清除已存在的 VM
 
+```bash
 for vmid in $(qm list | awk '$1 >= 9000 && $1 <= 9999 {print $1}'); do
   echo "Destroying VM $vmid"
   qm destroy $vmid --purge
 done
+```
 
 ## 许可证
 

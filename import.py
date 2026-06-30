@@ -58,6 +58,12 @@ except ImportError:
     print('Please run setup.sh to install them.')
     sys.exit(2)
 
+# 脚本所在目录（保证无论从哪个工作目录调用都能找到 uploads/ 等资源）
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 网络/内核 sysctl 调优脚本（import 与 update-templates.py 共用，单一数据源）
+TUNING_SCRIPT = os.path.join(SCRIPT_DIR, 'uploads', 'apply-net-tuning.sh')
+
 
 class DownloadProgressBar(tqdm.tqdm):
     def update_to(self, b=1, bsize=1, tsize=None):
@@ -121,7 +127,7 @@ def check_storage(name: str) -> StorageInfo.Base:
 def vm_exists_by_name(name: str) -> bool:
     try:
         out = subprocess.check_output(['qm', 'list'])
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, FileNotFoundError):
         return False
     for line in out.decode(errors='ignore').splitlines()[1:]:
         cols = line.split()
@@ -133,7 +139,7 @@ def vm_exists_by_name(name: str) -> bool:
 def list_existing_vm_names() -> set:
     try:
         out = subprocess.check_output(['qm', 'list'])
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, FileNotFoundError):
         return set()
     names = set()
     for line in out.decode(errors='ignore').splitlines()[1:]:
@@ -147,11 +153,34 @@ def build_customize_args(customize: Optional[dict]) -> list:
     if not customize:
         return []
     args = []
+    # upload：格式 "本地路径:镜像内路径"，本地相对路径基于本脚本目录解析（不依赖当前工作目录）
     for up in customize.get('uploads', []):
+        if ':' in up:
+            local, remote = up.split(':', 1)
+            local = _resolve(local)
+            up = f'{local}:{remote}'
         args += ['--upload', up]
+    # run：在镜像内执行宿主机上的脚本文件（相对路径基于本脚本目录解析）
+    for script in customize.get('run', []):
+        args += ['--run', _resolve(script)]
     for cmd in customize.get('commands', []):
         args += ['--run-command', cmd]
     return args
+
+
+def _resolve(path: str) -> str:
+    """将相对路径基于脚本所在目录解析为规范化的绝对路径。"""
+    if not os.path.isabs(path):
+        path = os.path.join(SCRIPT_DIR, path)
+    return os.path.normpath(path)
+
+
+def build_tuning_args() -> list:
+    """返回注入网络/内核调优所需的 virt-customize 参数。"""
+    if not os.path.exists(TUNING_SCRIPT):
+        print(f'Warning: tuning script not found at {TUNING_SCRIPT}, skipping net tuning.')
+        return []
+    return ['--run', TUNING_SCRIPT]
 
 
 def detect_os_family(template_name: str) -> Optional[str]:
@@ -445,7 +474,7 @@ def match_templates(all_tpls: list, filter_expr: Optional[str]) -> list:
     return uniq
 
 
-def import_template(template: dict, storage: StorageInfo.Base, vmid: int, keep_image: bool = True, refresh: bool = False, mirror_config: Optional[dict] = None):
+def import_template(template: dict, storage: StorageInfo.Base, vmid: int, keep_image: bool = True, refresh: bool = False, mirror_config: Optional[dict] = None, apply_tuning: bool = True):
     name = template['name']
     url  = template['url']
 
@@ -458,21 +487,24 @@ def import_template(template: dict, storage: StorageInfo.Base, vmid: int, keep_i
     unpack = template.get('unpack')  # 例如：'unzip -p {dl} > {img}'
     img = download_with_cache(name, url, unpack_cmd=unpack, refresh=refresh)
 
-    # 构建 virt-customize 参数：先配置镜像源，再执行其他自定义命令
+    # 构建 virt-customize 参数：先配置镜像源，再执行其他自定义命令，最后注入调优
     mirror_args = build_mirror_args(mirror_config, name)
     cust_args = build_customize_args(template.get('customize'))
-    all_cust_args = mirror_args + cust_args
+    # 网络/内核调优默认开启；模板可用 net_tuning: false 单独关闭，全局可用 --no-tuning 关闭
+    tuning_on = apply_tuning and template.get('net_tuning', True)
+    tuning_args = build_tuning_args() if tuning_on else []
+    all_cust_args = mirror_args + cust_args + tuning_args
 
     if all_cust_args:
         # 使用 direct 后端，避免某些宿主限制导致失败
         run(['virt-customize', '-a', img, *all_cust_args], LIBGUESTFS_BACKEND='direct')
 
     # 创建 VM 并导入磁盘
-    run(f'qm create {vmid} --name {name} --memory 512 --net0 virtio,bridge=vmbr0,queues=4 --cpu host,flags=+aes')
+    run(f'qm create {vmid} --name {name} --memory 512 --net0 virtio,bridge=vmbr0,queues=4 --cpu host,flags=+aes --ostype l26 --agent enabled=1,fstrim_cloned_disks=1')
     run(f'qm importdisk {vmid} {img} {storage.name} --format qcow2')
 
     disk = storage.format_disk_name(vmid)
-    run(f'qm set {vmid} --scsihw virtio-scsi-pci --scsi0 {storage.name}:{disk}')
+    run(f'qm set {vmid} --scsihw virtio-scsi-single --scsi0 {storage.name}:{disk},discard=on,ssd=1')
     run(f'qm set {vmid} --boot c --bootdisk scsi0')
     run(f'qm set {vmid} --serial0 socket')
 
@@ -480,6 +512,8 @@ def import_template(template: dict, storage: StorageInfo.Base, vmid: int, keep_i
         run(f'qm set {vmid} --ide2 {storage.name}:cloudinit')
         # 如需默认 root 用户，可在模板里 cloud-init 配置上传 ssh.cfg
         run(f'qm set {vmid} --ciuser root')
+        # 默认用 DHCP 获取 IPv4，避免克隆后无网络（可在克隆后再覆盖）
+        run(f'qm set {vmid} --ipconfig0 ip=dhcp')
 
     run(f'qm template {vmid}')
 
@@ -491,7 +525,56 @@ def import_template(template: dict, storage: StorageInfo.Base, vmid: int, keep_i
     print('Done\n')
 
 
+USAGE = '''Usage: python3 import.py <storage-name> <start-vmid> [template-name[,name2|glob]] [options]
+
+Options:
+  --only-new          只导入 PVE 中尚不存在的模板
+  --refresh           忽略缓存，强制重新下载镜像
+  --mirror <name>     使用 templates.yaml 中配置的镜像源（内网环境）
+  --no-tuning         本次导入不注入网络/内核 sysctl 调优（默认开启）
+  --list              列出 templates.yaml 中所有可用模板后退出
+  -h, --help          显示本帮助
+
+Examples:
+  python3 import.py local-lvm 900
+  python3 import.py local-lvm 900 --only-new
+  python3 import.py local-lvm 900 'ubuntu-*' --mirror tsinghua
+  python3 import.py --list'''
+
+
+def load_config() -> dict:
+    cfg_path = os.path.join(SCRIPT_DIR, 'templates.yaml')
+    with open(cfg_path, 'r', encoding='utf-8') as f:
+        return yaml.safe_load(f)
+
+
+def print_template_list():
+    config = load_config()
+    existing = list_existing_vm_names()
+    print('可用模板（templates.yaml）：')
+    for t in config.get('templates', []):
+        name = t['name']
+        flags = []
+        if name in existing:
+            flags.append('已存在')
+        if t.get('net_tuning', True) is False:
+            flags.append('调优:关')
+        suffix = f'  [{", ".join(flags)}]' if flags else ''
+        print(f'  - {name}{suffix}')
+    mirrors = config.get('mirrors', {})
+    if mirrors:
+        print(f'\n可用镜像源：{", ".join(mirrors.keys())}')
+
+
 def main():
+    # 提前处理无需依赖/参数的子命令
+    if any(a in ('-h', '--help') for a in sys.argv[1:]):
+        print(USAGE)
+        return
+    if '--list' in sys.argv[1:]:
+        print_template_list()
+        return
+
     # 依赖检查（只验证存在，不强制版本）
     try:
         subprocess.call(['virt-customize', '--version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -503,7 +586,7 @@ def main():
         sys.exit(2)
 
     if len(sys.argv) < 3:
-        print('Usage: python3 import.py <storage-name> <start-vmid> [template-name[,name2|glob]] [--only-new] [--refresh] [--mirror <mirror-name>]')
+        print(USAGE)
         sys.exit(1)
 
     storage_name = sys.argv[1]
@@ -517,6 +600,7 @@ def main():
     template_filter = None
     only_new = False
     refresh = False
+    apply_tuning = True
     mirror_name = None
     args = sys.argv[3:]
     i = 0
@@ -526,6 +610,8 @@ def main():
             only_new = True
         elif arg == '--refresh':
             refresh = True
+        elif arg == '--no-tuning':
+            apply_tuning = False
         elif arg == '--mirror':
             if i + 1 < len(args):
                 mirror_name = args[i + 1]
@@ -535,14 +621,17 @@ def main():
                 sys.exit(1)
         elif not arg.startswith('-'):
             template_filter = arg
+        else:
+            print(f'Error: unknown option "{arg}".')
+            print(USAGE)
+            sys.exit(1)
         i += 1
 
     storage = check_storage(storage_name)
 
-    with open('templates.yaml', 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-        all_tpls = config['templates']
-        mirrors = config.get('mirrors', {})
+    config = load_config()
+    all_tpls = config['templates']
+    mirrors = config.get('mirrors', {})
 
     # 获取镜像源配置
     mirror_config = None
@@ -555,6 +644,9 @@ def main():
         print(f'Using mirror: {mirror_name}')
 
     to_import_all = match_templates(all_tpls, template_filter)
+    if not to_import_all:
+        print('No templates matched. Use --list to see available templates.')
+        return
     if only_new:
         existing = list_existing_vm_names()
         to_import_all = [t for t in to_import_all if t['name'] not in existing]
@@ -566,7 +658,8 @@ def main():
             start_vmid + idx,
             keep_image=not refresh,
             refresh=refresh,
-            mirror_config=mirror_config
+            mirror_config=mirror_config,
+            apply_tuning=apply_tuning
         )
 
 
