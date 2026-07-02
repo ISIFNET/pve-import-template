@@ -146,11 +146,16 @@ def preflight_hints() -> list:
 
 
 def print_guestfs_hints():
-    print('\n—— virt-customize/guestfs_launch 失败常见原因与修复 ——')
-    print('  1) KVM 不可用（如 PVE 本身是嵌套虚拟机）：本工具已自动回退 force_tcg；也可全程加 --tcg')
-    print('  2) 宿主机内核不可读：chmod 0644 /boot/vmlinuz-*')
-    print('  3) 诊断：运行 `libguestfs-test-tool`，或本工具加 --debug 重跑查看详细日志')
-    print('  4) 内存不足：确保有足够空闲内存供 libguestfs appliance 启动（约需数百 MB）')
+    print('\n—— guestfs_launch failed 排障（KVM 与软件模拟都失败=appliance 本身起不来）——')
+    print('  1) 宿主机内核不可读（Proxmox 最常见）：')
+    print('       chmod 0644 /boot/vmlinuz-*')
+    print('  2) 重建 libguestfs appliance 缓存：')
+    print('       update-guestfs-appliance   # 或删除 /var/tmp/.guestfs-* 后重试')
+    print('  3) 先做一次独立诊断（不依赖磁盘），把结尾输出发出来定位：')
+    print('       libguestfs-test-tool 2>&1 | tail -40')
+    print('  4) 抓取本工具的详细日志：')
+    print('       python3 update-templates.py <vmid> --tcg --debug -y 2>&1 | tail -60')
+    print('  5) 内存不足：确保有数百 MB 空闲内存供 appliance 启动。')
 
 
 def list_vms() -> list:
@@ -546,25 +551,20 @@ def main():
         va = []
         for _, args in actions:
             va += args
+        success = False
         try:
             run_virt_customize(path, va, opts['dry_run'],
                                force_tcg=opts['force_tcg'], debug=opts['debug'])
-            ok += 1
-        except subprocess.CalledProcessError as e:
-            # 常见失败：KVM 不可用导致 guestfs_launch failed。自动回退软件模拟重试一次。
+            success = True
+        except subprocess.CalledProcessError:
+            # KVM 不可用会导致 guestfs_launch failed；自动回退软件模拟重试一次。
             if not opts['force_tcg'] and not opts['dry_run']:
                 print('  virt-customize 失败，回退到软件模拟（force_tcg）重试 ...')
                 try:
                     run_virt_customize(path, va, opts['dry_run'], force_tcg=True, debug=opts['debug'])
-                    ok += 1
-                except subprocess.CalledProcessError as e2:
-                    print(f'  失败：virt-customize 返回非零（{e2.returncode}）。')
-                    guestfs_failed = True
-                    failed += 1
-            else:
-                print(f'  失败：virt-customize 返回非零（{e.returncode}）。')
-                guestfs_failed = True
-                failed += 1
+                    success = True
+                except subprocess.CalledProcessError:
+                    pass
         finally:
             # 恢复模板基卷的「未激活」默认状态（仅当本工具激活过它）
             if activated_lv:
@@ -572,6 +572,20 @@ def main():
                     lv_deactivate(activated_lv, opts['dry_run'])
                 except (subprocess.CalledProcessError, FileNotFoundError):
                     print(f'  警告：恢复未激活状态失败：lvchange -an {activated_lv}')
+
+        if success:
+            ok += 1
+        else:
+            failed += 1
+            guestfs_failed = True
+            # KVM 与软件模拟都失败 → libguestfs appliance 本身起不来（宿主机环境问题），
+            # 会影响所有目标，继续尝试其余模板没有意义，直接中止。
+            remaining = len(targets) - (ok + failed + skipped)
+            if remaining > 0:
+                print(f'  失败：virt-customize 无法启动 appliance；这是宿主机 libguestfs 环境问题，'
+                      f'会影响全部目标，已中止（跳过剩余 {remaining} 个）。')
+                skipped += remaining
+            break
 
     print(f'\n完成：成功 {ok}，失败 {failed}，跳过 {skipped}'
           f'{"（dry-run，未真正修改）" if opts["dry_run"] else ""}。')
