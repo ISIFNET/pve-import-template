@@ -142,9 +142,16 @@ openSUSE（zypper）、Arch（pacman）、**Alpine（apk + openrc）**。安装�
 
 ### 网络/内核调优（`apply-net-tuning.sh`，**默认对所有模板开启**）
 
-写入 `/etc/sysctl.d/99-network-tuning.conf` 与 `/etc/modules-load.d/bbr.conf`，开机生效；不支持的内核参数会被自动忽略：
+写入 `/etc/sysctl.d/99-network-tuning.conf`，开机生效；不支持的内核参数会被自动忽略。
+
+**分 init 系统处理**（脚本从目标系统 `/etc/os-release` 判断，不依赖 libguestfs 沙箱内核）：
+- **systemd 系**（Debian/Ubuntu/RHEL/Rocky/Alma/Fedora/openSUSE/Arch）：模块写 `/etc/modules-load.d/bbr.conf`
+- **非 systemd**（Alpine/openrc 等）：模块写 `/etc/modules`，并尽量启用 `sysctl` 服务
+
+参数（核心 BBR + 大缓冲，及互补的稳健增强项）：
 
 ```ini
+# 核心：BBR + 大缓冲（高带宽时延积）
 net.core.default_qdisc = fq
 net.core.rmem_max = 67108848
 net.core.wmem_max = 67108848
@@ -158,11 +165,19 @@ net.ipv4.tcp_sack = 1
 net.ipv4.tcp_timestamps = 1
 kernel.panic = -1
 vm.swappiness = 0
+# 增强：与 BBR/大缓冲互补（不支持的内核自动忽略）
+net.ipv4.tcp_slow_start_after_idle = 0   # 长连接空闲后不回退拥塞窗口
+net.ipv4.tcp_mtu_probing = 1             # 缓解 PMTU 黑洞
+net.ipv4.tcp_fastopen = 3                # TCP Fast Open（客户端+服务端）
+net.ipv4.tcp_notsent_lowat = 131072      # 配合 BBR 降低 bufferbloat/延迟
+net.core.netdev_max_backlog = 16384      # 高 pps 入队缓冲
+net.ipv4.tcp_max_tw_buckets = 262144     # TIME_WAIT 上限
 ```
 
-**按发行版差异**：Alpine（musl/openrc，模块加载与 sysctl 行为不同）默认**不**注入调优（`net_tuning: false`）。
-- 关闭单个模板：在该模板下加 `net_tuning: false`
-- 全局关闭：`--no-tuning`
+**按发行版差异**：Alpine（musl/openrc，busybox `sysctl` 行为不一致）默认**不**注入调优（`net_tuning: false`）；
+脚本已支持 openrc，如需可在该模板设 `net_tuning: true` 开启。
+- 关闭单个模板：在该模板下加 `net_tuning: false`；全局关闭：`--no-tuning`
+- **对已导入的模板套用新参数**：`python3 update-templates.py --all`（本节点）
 
 ### Alpine DNS
 

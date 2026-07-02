@@ -4,6 +4,19 @@
 
 ## [Unreleased] - 2026-07-02
 
+### 调优参数增强与分系统处理
+
+- **`apply-net-tuning.sh` 改为按 init 系统分别处理**：
+  - systemd 系（Debian/Ubuntu/RHEL/openSUSE/Arch）用 `/etc/modules-load.d/bbr.conf`；
+  - 非 systemd（Alpine/openrc 等）改用 `/etc/modules` 并尽量启用 `sysctl` 服务。
+  - 从目标系统 `/etc/os-release` 读取发行版信息（沙箱内可安全读取；不依赖沙箱内核版本）。
+- **sysctl 参数集在原有基础上补充了与 BBR/大缓冲互补的稳健增强项**（不支持的内核会自动忽略）：
+  `tcp_slow_start_after_idle=0`、`tcp_mtu_probing=1`、`tcp_fastopen=3`、
+  `tcp_notsent_lowat=131072`、`net.core.netdev_max_backlog=16384`、`tcp_max_tw_buckets=262144`。
+- 说明：对**已导入**的模板，运行 `python3 update-templates.py --all` 即可套用新参数。
+- Alpine 仍默认 `net_tuning: false`（busybox `sysctl` 行为不一致更保守）；脚本已支持 openrc，
+  如需可在该模板设 `net_tuning: true` 手动开启。
+
 ### 多节点集群支持
 
 - **`update-templates.py` 默认只处理「本节点」的模板**：`pvesh` 在集群里会返回所有节点的 VM，
