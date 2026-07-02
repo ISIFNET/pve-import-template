@@ -149,6 +149,42 @@ def list_existing_vm_names() -> set:
     return names
 
 
+def cluster_vm_index() -> Tuple[set, set]:
+    """返回 (已用 VMID 集合, 已存在名称集合)。
+
+    VMID 在 PVE 集群内全局唯一，因此优先用 pvesh 跨节点收集，避免与其他节点的 VM
+    冲突导致 `qm create` 失败；pvesh 不可用时回退到本节点 `qm list`。
+    """
+    try:
+        out = subprocess.check_output(
+            ['pvesh', 'get', '/cluster/resources', '--type', 'vm', '--output-format', 'json'])
+        vmids, names = set(), set()
+        for r in json.loads(out):
+            if r.get('type') != 'qemu':
+                continue
+            vid = r.get('vmid')
+            if vid is not None:
+                vmids.add(int(vid))
+            nm = r.get('name')
+            if nm:
+                names.add(nm)
+        return vmids, names
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        pass
+    # 回退：仅本节点
+    names = list_existing_vm_names()
+    vmids = set()
+    try:
+        out = subprocess.check_output(['qm', 'list'])
+        for line in out.decode(errors='ignore').splitlines()[1:]:
+            cols = line.split()
+            if cols and cols[0].isdigit():
+                vmids.add(int(cols[0]))
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    return vmids, names
+
+
 def build_customize_args(customize: Optional[dict]) -> list:
     if not customize:
         return []
@@ -550,7 +586,7 @@ def load_config() -> dict:
 
 def print_template_list():
     config = load_config()
-    existing = list_existing_vm_names()
+    _, existing = cluster_vm_index()
     print('可用模板（templates.yaml）：')
     for t in config.get('templates', []):
         name = t['name']
@@ -647,20 +683,28 @@ def main():
     if not to_import_all:
         print('No templates matched. Use --list to see available templates.')
         return
-    if only_new:
-        existing = list_existing_vm_names()
-        to_import_all = [t for t in to_import_all if t['name'] not in existing]
 
-    for idx, tpl in enumerate(to_import_all):
+    # 跨集群收集已用 VMID / 名称：--only-new 跨节点判断，VMID 分配自动跳过已占用（集群内 VMID 全局唯一）
+    used_vmids, existing_names = cluster_vm_index()
+    if only_new:
+        to_import_all = [t for t in to_import_all if t['name'] not in existing_names]
+
+    vmid = start_vmid
+    for tpl in to_import_all:
+        while vmid in used_vmids:
+            print(f'VMID {vmid} 已被占用（集群内），跳过。')
+            vmid += 1
         import_template(
             tpl,
             storage,
-            start_vmid + idx,
+            vmid,
             keep_image=not refresh,
             refresh=refresh,
             mirror_config=mirror_config,
             apply_tuning=apply_tuning
         )
+        used_vmids.add(vmid)
+        vmid += 1
 
 
 if __name__ == '__main__':

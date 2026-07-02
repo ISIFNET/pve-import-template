@@ -34,10 +34,16 @@ update-templates.py - 对「已经导入 PVE 的虚拟机模板」就地重新�
 
 选项
   --vms             允许选中非模板的普通 VM（必须处于 stopped 状态）
+  --node <name>     指定作用的 PVE 节点（默认自动识别为本节点）
+  --all-nodes       放开节点限制（危险：对非本节点的 VM 执行会失败）
   --dry-run         只打印将执行的操作，不真正修改
   -y, --yes         跳过确认提示
-  --list            列出所有模板及其系统盘后退出
+  --list            列出（本节点）所有模板及其系统盘后退出
   -h, --help        显示帮助
+
+多节点集群
+  virt-customize / qm / pvesm 只能操作「本节点」的磁盘。集群里 pvesh 会返回所有节点的
+  VM，因此本工具默认只处理「本节点」的模板；要更新其他节点的模板，请到对应节点上分别运行。
 
 示例
   python3 update-templates.py --list
@@ -68,6 +74,25 @@ PERMIT_ROOT_SCRIPT = os.path.join(UPLOADS, 'permit-root-login.sh')
 
 # qm config 中代表磁盘的前缀；EFI / TPM / cloudinit / cdrom 会被跳过
 DISK_PREFIXES = ('scsi', 'virtio', 'sata', 'ide')
+
+
+def local_node_name() -> Optional[str]:
+    """获取当前 PVE 节点名（用于把操作限制在本节点）。
+
+    virt-customize / qm 只能操作「本节点」的磁盘；集群里 pvesh 会返回所有节点的 VM，
+    直接对其他节点的 VM 执行会失败（无权限/找不到磁盘）。因此默认只处理本节点。
+    """
+    # 1) 最权威：/etc/pve/local 是指向 /etc/pve/nodes/<nodename> 的符号链接
+    try:
+        return os.path.basename(os.readlink('/etc/pve/local').rstrip('/')) or None
+    except OSError:
+        pass
+    # 2) 回退：短主机名（PVE 节点名即短主机名）
+    try:
+        out = subprocess.check_output(['hostname'], stderr=subprocess.DEVNULL)
+        return out.decode(errors='ignore').strip().split('.')[0] or None
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
 
 
 def run(cmd, dry_run: bool = False, **extra_env):
@@ -233,6 +258,8 @@ def parse_args(argv):
     dry_run = False
     assume_yes = False
     do_list = False
+    node = None
+    all_nodes = False
 
     i = 0
     while i < len(argv):
@@ -242,6 +269,14 @@ def parse_args(argv):
             sys.exit(0)
         elif a == '--all':
             want_all = True
+        elif a == '--node':
+            if i + 1 >= len(argv):
+                print('Error: --node requires a node name.')
+                sys.exit(1)
+            node = argv[i + 1]
+            i += 1
+        elif a == '--all-nodes':
+            all_nodes = True
         elif a == '--vms':
             include_vms = True
         elif a == '--tuning':
@@ -274,20 +309,21 @@ def parse_args(argv):
     return dict(selectors=selectors, want_all=want_all, include_vms=include_vms,
                 apply_tuning=apply_tuning, qga=qga, permit_root=permit_root,
                 extra_runs=extra_runs, dry_run=dry_run, assume_yes=assume_yes,
-                do_list=do_list)
+                do_list=do_list, node=node, all_nodes=all_nodes)
 
 
-def print_list(vms: list):
+def print_list(vms: list, scope: str = ''):
     templates = [v for v in vms if v['template'] == 1]
     if not templates:
-        print('未发现任何模板 VM。')
+        print(f'未发现任何模板 VM{("（" + scope + "）") if scope else ""}。')
         return
-    print('已有模板：')
+    print(f'已有模板{("（" + scope + "）") if scope else ""}：')
     for v in sorted(templates, key=lambda x: x['vmid']):
         cfg = get_config(v['vmid'])
         volid = find_os_disk_volid(cfg)
         disk = volid or '(未识别系统盘)'
-        print(f"  {v['vmid']:>6}  {v['name']:<24} disk={disk}")
+        node = f" node={v['node']}" if v.get('node') else ''
+        print(f"  {v['vmid']:>6}  {v['name']:<24}{node} disk={disk}")
 
 
 def main():
@@ -303,8 +339,21 @@ def main():
 
     vms = list_vms()
 
+    # 限定作用范围：默认只处理「本节点」的 VM（virt-customize/qm 只能操作本节点磁盘）。
+    # --node <name> 指定节点；--all-nodes 显式放开（仅当你确认全部 VM 都在本节点时才有意义）。
+    local = opts['node'] or local_node_name()
+    if opts['all_nodes']:
+        node_vms, scope = vms, '所有节点'
+        print('注意：--all-nodes 已启用；对非本节点的 VM 执行会失败，请仅在确知的情况下使用。')
+    elif local:
+        node_vms = [v for v in vms if (v.get('node') or local) == local]
+        scope = f'节点 {local}'
+    else:
+        node_vms, scope = vms, '未能确定本节点，未过滤'
+        print('Warning: 无法确定本节点名（非 PVE 环境？），未按节点过滤。')
+
     if opts['do_list']:
-        print_list(vms)
+        print_list(node_vms, scope)
         return
 
     if not opts['selectors'] and not opts['want_all']:
@@ -325,13 +374,25 @@ def main():
                     print(f'Error: 脚本不存在：{spath}')
                     sys.exit(1)
 
-    targets = select_targets(vms, opts['selectors'], opts['want_all'], opts['include_vms'])
+    targets = select_targets(node_vms, opts['selectors'], opts['want_all'], opts['include_vms'])
+
+    # 对「明确按 VMID 指定、但其实位于其他节点」的选择器给出可执行的提示
+    if not opts['all_nodes'] and local:
+        picked = {v['vmid'] for v in targets}
+        for sel in opts['selectors']:
+            if sel.isdigit():
+                vid = int(sel)
+                remote = [v for v in vms if v['vmid'] == vid and (v.get('node') or local) != local]
+                if remote and vid not in picked:
+                    print(f'提示：VM {vid} 位于节点 {remote[0].get("node") or "?"}，'
+                          f'请在该节点上运行本工具（virt-customize 只能修改本节点磁盘）。')
+
     if not targets:
-        print('没有匹配到任何目标。')
+        print(f'没有匹配到任何目标（作用范围：{scope}）。')
         sys.exit(1)
 
     action_labels = ', '.join(label for label, _ in actions)
-    print(f'\n将对以下 {len(targets)} 个目标应用动作 [{action_labels}]：')
+    print(f'\n[作用范围：{scope}] 将对以下 {len(targets)} 个目标应用动作 [{action_labels}]：')
     for v in targets:
         kind = '模板' if v['template'] == 1 else f"VM({v['status']})"
         print(f"  {v['vmid']:>6}  {v['name']:<24} [{kind}]")

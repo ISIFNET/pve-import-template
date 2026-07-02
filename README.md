@@ -71,6 +71,9 @@ python3 import.py local-lvm 900 'rocky-*' --no-tuning
 - `--net0 virtio,bridge=vmbr0,queues=4`、`--serial0 socket`
 - 启用 cloud-init 时：挂载 cloudinit 盘、`--ciuser root`、`--ipconfig0 ip=dhcp`
 
+> **集群**：`--only-new` 跨节点判断模板是否已存在；分配 VMID 时自动跳过集群内已占用的 ID
+> （VMID 全局唯一），避免与其他节点的 VM 冲突而 `qm create` 失败。
+
 ## update-templates.py —— 更新已导入的模板
 
 给**已经存在**的模板补充或更新设置，直接对模板系统盘运行 `virt-customize`，不重下镜像、不改 VMID。
@@ -90,19 +93,22 @@ python3 update-templates.py [选择器 ...] [动作] [选项]
 | `--permit-root` | 允许 root SSH 登录 |
 | `--run <script>` | 运行任意宿主机脚本（可重复） |
 
-**选项**：`--vms`（允许选中已停止的普通 VM）、`--dry-run`（预演）、`-y/--yes`（跳过确认）、`--list`、`-h/--help`
+**选项**：`--vms`（允许选中已停止的普通 VM）、`--node <name>`、`--all-nodes`、`--dry-run`（预演）、`-y/--yes`（跳过确认）、`--list`、`-h/--help`
 
 ### 示例
 
 ```bash
-python3 update-templates.py --list                     # 列出模板及其系统盘
-python3 update-templates.py --all --dry-run            # 预演：对所有模板应用网络调优
-python3 update-templates.py --all                      # 给所有模板补网络调优
+python3 update-templates.py --list                     # 列出（本节点）模板及其系统盘
+python3 update-templates.py --all --dry-run            # 预演：对本节点所有模板应用网络调优
+python3 update-templates.py --all                      # 给本节点所有模板补网络调优
 python3 update-templates.py --all --qga --permit-root  # 同时补 qga + 允许 root
 python3 update-templates.py 'ubuntu-*' --no-tuning --qga
 python3 update-templates.py 9000 9001 -y
 ```
 
+> **多节点集群**：`virt-customize`/`qm`/`pvesm` 只能操作**本节点**的磁盘。集群里 `pvesh` 会返回所有节点的 VM，
+> 因此本工具**默认只处理本节点的模板**；要更新其他节点上的模板，请到对应节点分别运行（或用 `--node`）。
+>
 > ⚠ `virt-customize` 会**就地**修改模板系统盘。若该模板已被**链接克隆（linked clone，常见于 lvmthin/zfs）**，
 > 修改基卷可能影响这些克隆，请谨慎并建议先备份/快照。`--qga` 等联网安装动作要求宿主机可访问软件源。
 
