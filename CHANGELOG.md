@@ -4,6 +4,13 @@
 
 ## [Unreleased] - 2026-07-02
 
+### 修复
+
+- **`update-templates.py` 支持 LVM/LVM-thin 上的模板基卷**：PVE 的模板基卷（`base-*`）默认带
+  「activation-skip」标志、处于未激活状态，`/dev/<vg>/<lv>` 设备节点不存在，导致
+  `virt-customize: No such file or directory`。现在会在定制前用 `lvchange -ay -K` 激活、
+  用完后 `lvchange -an` 恢复未激活状态（仅当本工具激活过它）；非 LVM 卷（qcow2/zvol）行为不变。
+
 ### 调优参数增强与分系统处理
 
 - **`apply-net-tuning.sh` 改为按 init 系统分别处理**：

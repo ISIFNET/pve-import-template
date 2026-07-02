@@ -109,6 +109,9 @@ python3 update-templates.py 9000 9001 -y
 > **多节点集群**：`virt-customize`/`qm`/`pvesm` 只能操作**本节点**的磁盘。集群里 `pvesh` 会返回所有节点的 VM，
 > 因此本工具**默认只处理本节点的模板**；要更新其他节点上的模板，请到对应节点分别运行（或用 `--node`）。
 >
+> **LVM/LVM-thin 模板**：PVE 模板基卷（`base-*`）默认未激活，工具会在定制前 `lvchange -ay -K` 激活、
+> 用完后 `lvchange -an` 恢复；无需手动处理。
+>
 > ⚠ `virt-customize` 会**就地**修改模板系统盘。若该模板已被**链接克隆（linked clone，常见于 lvmthin/zfs）**，
 > 修改基卷可能影响这些克隆，请谨慎并建议先备份/快照。`--qga` 等联网安装动作要求宿主机可访问软件源。
 

@@ -207,6 +207,24 @@ def resolve_disk_path(volid: str) -> Optional[str]:
     return path or None
 
 
+def lvm_lv_from_path(path: str) -> Optional[str]:
+    """把 /dev/<vg>/<lv> 形式的路径解析为 'vg/lv'（供 lvchange 使用）；否则返回 None。"""
+    parts = path.split('/')
+    # ['', 'dev', '<vg>', '<lv>']
+    if len(parts) == 4 and parts[1] == 'dev' and parts[2] not in ('mapper', 'zvol'):
+        return f'{parts[2]}/{parts[3]}'
+    return None
+
+
+def lv_activate(lv: str, dry_run: bool):
+    # -K 忽略「activation skip」标志：PVE 的模板基卷默认带该标志，普通 -ay 不会激活
+    run(['lvchange', '-ay', '-K', lv], dry_run=dry_run)
+
+
+def lv_deactivate(lv: str, dry_run: bool):
+    run(['lvchange', '-an', lv], dry_run=dry_run)
+
+
 def select_targets(vms: list, selectors: list, want_all: bool, include_vms: bool) -> list:
     pool = vms if include_vms else [v for v in vms if v['template'] == 1]
     if want_all:
@@ -438,6 +456,33 @@ def main():
 
         print(f'  系统盘：{volid} -> {path}')
 
+        # LVM/LVM-thin：模板基卷默认未激活（带 activation-skip 标志），
+        # /dev/<vg>/<lv> 设备节点此时不存在，需先激活、用完再恢复未激活状态。
+        activated_lv = None
+        if not os.path.exists(path):
+            lv = lvm_lv_from_path(path)
+            if lv:
+                print(f'  卷未激活，激活 LVM 卷 {lv} ...')
+                try:
+                    lv_activate(lv, opts['dry_run'])
+                    activated_lv = lv
+                except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                    print(f'  跳过：激活 LVM 卷失败（{e}）。')
+                    skipped += 1
+                    continue
+                if not opts['dry_run'] and not os.path.exists(path):
+                    print(f'  跳过：激活后仍找不到设备 {path}。')
+                    try:
+                        lv_deactivate(lv, opts['dry_run'])
+                    except (subprocess.CalledProcessError, FileNotFoundError):
+                        pass
+                    skipped += 1
+                    continue
+            elif not opts['dry_run']:
+                print(f'  跳过：磁盘路径不存在且非 LVM 卷：{path}')
+                skipped += 1
+                continue
+
         va = []
         for _, args in actions:
             va += args
@@ -448,6 +493,13 @@ def main():
         except subprocess.CalledProcessError as e:
             print(f'  失败：virt-customize 返回非零（{e.returncode}）。')
             failed += 1
+        finally:
+            # 恢复模板基卷的「未激活」默认状态（仅当本工具激活过它）
+            if activated_lv:
+                try:
+                    lv_deactivate(activated_lv, opts['dry_run'])
+                except (subprocess.CalledProcessError, FileNotFoundError):
+                    print(f'  警告：恢复未激活状态失败：lvchange -an {activated_lv}')
 
     print(f'\n完成：成功 {ok}，失败 {failed}，跳过 {skipped}'
           f'{"（dry-run，未真正修改）" if opts["dry_run"] else ""}。')
