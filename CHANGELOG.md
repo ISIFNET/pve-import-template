@@ -6,6 +6,10 @@
 
 ### 修复
 
+- **libguestfs `guestfs_launch failed` 自动回退**：当 KVM 不可用（如 PVE 本身是嵌套虚拟机）
+  导致 appliance 启动失败时，`import.py` 与 `update-templates.py` 会自动用 `force_tcg`（软件模拟）
+  重试一次。`update-templates.py` 另加 `--tcg`（全程强制软件模拟）、`--debug`（详细日志）、
+  失败时打印排障提示，并对宿主机内核不可读 / 缺少 `/dev/kvm` 做预检提示。
 - **`update-templates.py` 支持 LVM/LVM-thin 上的模板基卷**：PVE 的模板基卷（`base-*`）默认带
   「activation-skip」标志、处于未激活状态，`/dev/<vg>/<lv>` 设备节点不存在，导致
   `virt-customize: No such file or directory`。现在会在定制前用 `lvchange -ay -K` 激活、

@@ -532,8 +532,14 @@ def import_template(template: dict, storage: StorageInfo.Base, vmid: int, keep_i
     all_cust_args = mirror_args + cust_args + tuning_args
 
     if all_cust_args:
-        # 使用 direct 后端，避免某些宿主限制导致失败
-        run(['virt-customize', '-a', img, *all_cust_args], LIBGUESTFS_BACKEND='direct')
+        # 使用 direct 后端，避免某些宿主限制导致失败；
+        # 若 KVM 不可用（如 PVE 本身是嵌套虚拟机）导致 guestfs_launch 失败，自动回退软件模拟重试。
+        try:
+            run(['virt-customize', '-a', img, *all_cust_args], LIBGUESTFS_BACKEND='direct')
+        except subprocess.CalledProcessError:
+            print('virt-customize 失败，回退到软件模拟（force_tcg）重试 ...')
+            run(['virt-customize', '-a', img, *all_cust_args],
+                LIBGUESTFS_BACKEND='direct', LIBGUESTFS_BACKEND_SETTINGS='force_tcg')
 
     # 创建 VM 并导入磁盘
     run(f'qm create {vmid} --name {name} --memory 512 --net0 virtio,bridge=vmbr0,queues=4 --cpu host,flags=+aes --ostype l26 --agent enabled=1,fstrim_cloned_disks=1')

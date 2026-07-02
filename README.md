@@ -93,7 +93,7 @@ python3 update-templates.py [选择器 ...] [动作] [选项]
 | `--permit-root` | 允许 root SSH 登录 |
 | `--run <script>` | 运行任意宿主机脚本（可重复） |
 
-**选项**：`--vms`（允许选中已停止的普通 VM）、`--node <name>`、`--all-nodes`、`--dry-run`（预演）、`-y/--yes`（跳过确认）、`--list`、`-h/--help`
+**选项**：`--vms`（允许选中已停止的普通 VM）、`--node <name>`、`--all-nodes`、`--dry-run`（预演）、`--tcg`（强制软件模拟）、`--debug`（libguestfs 详细日志）、`-y/--yes`（跳过确认）、`--list`、`-h/--help`
 
 ### 示例
 
@@ -111,6 +111,9 @@ python3 update-templates.py 9000 9001 -y
 >
 > **LVM/LVM-thin 模板**：PVE 模板基卷（`base-*`）默认未激活，工具会在定制前 `lvchange -ay -K` 激活、
 > 用完后 `lvchange -an` 恢复；无需手动处理。
+>
+> **`guestfs_launch failed`**：多因 KVM 不可用（如 PVE 本身是嵌套虚拟机）。工具会自动回退 `force_tcg`
+> 软件模拟重试；仍失败可加 `--tcg` 全程软件模拟、`--debug` 看详细日志，或 `chmod 0644 /boot/vmlinuz-*`。
 >
 > ⚠ `virt-customize` 会**就地**修改模板系统盘。若该模板已被**链接克隆（linked clone，常见于 lvmthin/zfs）**，
 > 修改基卷可能影响这些克隆，请谨慎并建议先备份/快照。`--qga` 等联网安装动作要求宿主机可访问软件源。

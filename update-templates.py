@@ -37,9 +37,14 @@ update-templates.py - 对「已经导入 PVE 的虚拟机模板」就地重新�
   --node <name>     指定作用的 PVE 节点（默认自动识别为本节点）
   --all-nodes       放开节点限制（危险：对非本节点的 VM 执行会失败）
   --dry-run         只打印将执行的操作，不真正修改
+  --tcg             强制 libguestfs 用软件模拟启动（KVM 不可用/嵌套虚拟机时）
+  --debug           打开 libguestfs 详细日志（排查 guestfs_launch 失败）
   -y, --yes         跳过确认提示
   --list            列出（本节点）所有模板及其系统盘后退出
   -h, --help        显示帮助
+
+排障：若报 "guestfs_launch failed"，本工具会自动回退 force_tcg 重试；仍失败见结尾提示，
+      或用 `libguestfs-test-tool` 诊断、加 --debug 查看详细日志。
 
 多节点集群
   virt-customize / qm / pvesm 只能操作「本节点」的磁盘。集群里 pvesh 会返回所有节点的
@@ -102,6 +107,50 @@ def run(cmd, dry_run: bool = False, **extra_env):
     env = os.environ.copy()
     env.update(extra_env)
     subprocess.run(cmd, check=True, env=env, shell=isinstance(cmd, str))
+
+
+def run_virt_customize(path: str, va: list, dry_run: bool, force_tcg: bool = False, debug: bool = False):
+    env = {'LIBGUESTFS_BACKEND': 'direct'}
+    if force_tcg:
+        # KVM 不可用（如 PVE 本身是嵌套虚拟机）时，强制软件模拟启动 appliance
+        env['LIBGUESTFS_BACKEND_SETTINGS'] = 'force_tcg'
+    if debug:
+        env['LIBGUESTFS_DEBUG'] = '1'
+        env['LIBGUESTFS_TRACE'] = '1'
+    run(['virt-customize', '-a', path, *va], dry_run=dry_run, **env)
+
+
+def preflight_hints() -> list:
+    """返回 libguestfs 常见前置问题的提示（不阻断执行）。"""
+    hints = []
+    try:
+        rel = os.uname().release
+    except Exception:
+        rel = ''
+    import glob
+    kernels = [f'/boot/vmlinuz-{rel}'] if rel and os.path.exists(f'/boot/vmlinuz-{rel}') \
+        else glob.glob('/boot/vmlinuz-*')
+    unreadable = []
+    for k in kernels:
+        try:
+            if not (os.stat(k).st_mode & 0o044):  # 非 group/other 可读
+                unreadable.append(k)
+        except OSError:
+            pass
+    if unreadable:
+        hints.append('宿主机内核非全局可读，libguestfs 可能无法读取：'
+                     + ', '.join(unreadable) + '；如遇 guestfs_launch 失败可执行：chmod 0644 /boot/vmlinuz-*')
+    if not os.path.exists('/dev/kvm'):
+        hints.append('未发现 /dev/kvm：libguestfs 将使用软件模拟（TCG，较慢）。')
+    return hints
+
+
+def print_guestfs_hints():
+    print('\n—— virt-customize/guestfs_launch 失败常见原因与修复 ——')
+    print('  1) KVM 不可用（如 PVE 本身是嵌套虚拟机）：本工具已自动回退 force_tcg；也可全程加 --tcg')
+    print('  2) 宿主机内核不可读：chmod 0644 /boot/vmlinuz-*')
+    print('  3) 诊断：运行 `libguestfs-test-tool`，或本工具加 --debug 重跑查看详细日志')
+    print('  4) 内存不足：确保有足够空闲内存供 libguestfs appliance 启动（约需数百 MB）')
 
 
 def list_vms() -> list:
@@ -278,6 +327,8 @@ def parse_args(argv):
     do_list = False
     node = None
     all_nodes = False
+    force_tcg = False
+    debug = False
 
     i = 0
     while i < len(argv):
@@ -313,6 +364,10 @@ def parse_args(argv):
             i += 1
         elif a == '--dry-run':
             dry_run = True
+        elif a == '--tcg':
+            force_tcg = True
+        elif a == '--debug':
+            debug = True
         elif a in ('-y', '--yes'):
             assume_yes = True
         elif a == '--list':
@@ -327,7 +382,8 @@ def parse_args(argv):
     return dict(selectors=selectors, want_all=want_all, include_vms=include_vms,
                 apply_tuning=apply_tuning, qga=qga, permit_root=permit_root,
                 extra_runs=extra_runs, dry_run=dry_run, assume_yes=assume_yes,
-                do_list=do_list, node=node, all_nodes=all_nodes)
+                do_list=do_list, node=node, all_nodes=all_nodes,
+                force_tcg=force_tcg, debug=debug)
 
 
 def print_list(vms: list, scope: str = ''):
@@ -414,7 +470,10 @@ def main():
     for v in targets:
         kind = '模板' if v['template'] == 1 else f"VM({v['status']})"
         print(f"  {v['vmid']:>6}  {v['name']:<24} [{kind}]")
-    print('\n⚠ virt-customize 会就地修改系统盘；若存在链接克隆请谨慎，建议先备份。\n')
+    print('\n⚠ virt-customize 会就地修改系统盘；若存在链接克隆请谨慎，建议先备份。')
+    for h in preflight_hints():
+        print(f'  提示：{h}')
+    print()
 
     if not opts['dry_run'] and not opts['assume_yes']:
         try:
@@ -426,6 +485,7 @@ def main():
             return
 
     ok, failed, skipped = 0, 0, 0
+    guestfs_failed = False
     for v in targets:
         vmid, name = v['vmid'], v['name']
         print(f'\n=== {vmid} ({name}) ===')
@@ -487,12 +547,24 @@ def main():
         for _, args in actions:
             va += args
         try:
-            run(['virt-customize', '-a', path, *va],
-                dry_run=opts['dry_run'], LIBGUESTFS_BACKEND='direct')
+            run_virt_customize(path, va, opts['dry_run'],
+                               force_tcg=opts['force_tcg'], debug=opts['debug'])
             ok += 1
         except subprocess.CalledProcessError as e:
-            print(f'  失败：virt-customize 返回非零（{e.returncode}）。')
-            failed += 1
+            # 常见失败：KVM 不可用导致 guestfs_launch failed。自动回退软件模拟重试一次。
+            if not opts['force_tcg'] and not opts['dry_run']:
+                print('  virt-customize 失败，回退到软件模拟（force_tcg）重试 ...')
+                try:
+                    run_virt_customize(path, va, opts['dry_run'], force_tcg=True, debug=opts['debug'])
+                    ok += 1
+                except subprocess.CalledProcessError as e2:
+                    print(f'  失败：virt-customize 返回非零（{e2.returncode}）。')
+                    guestfs_failed = True
+                    failed += 1
+            else:
+                print(f'  失败：virt-customize 返回非零（{e.returncode}）。')
+                guestfs_failed = True
+                failed += 1
         finally:
             # 恢复模板基卷的「未激活」默认状态（仅当本工具激活过它）
             if activated_lv:
@@ -503,6 +575,8 @@ def main():
 
     print(f'\n完成：成功 {ok}，失败 {failed}，跳过 {skipped}'
           f'{"（dry-run，未真正修改）" if opts["dry_run"] else ""}。')
+    if guestfs_failed:
+        print_guestfs_hints()
 
 
 if __name__ == '__main__':
