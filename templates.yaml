@@ -8,6 +8,7 @@
 #   * ./uploads/apply-net-tuning.sh    BBR + 网络/内核 sysctl 调优（由 import.py 默认注入，无需在此声明）
 # - 网络/内核调优默认对所有模板开启；如某发行版不适用，可在该模板下加 net_tuning: false；
 #   也可在命令行用 --no-tuning 全局关闭。
+# - 磁盘默认启用 discard 以回收精简置备存储空间，但不设置 ssd=1，不向访客伪装 SSD。
 # - customize 支持的键：uploads（--upload）、run（--run 脚本文件）、commands（--run-command 内联命令）。
 
 # 镜像源配置 - 用于内网环境

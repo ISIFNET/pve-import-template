@@ -43,6 +43,8 @@ import.py - Proxmox VE Cloud Image Importer
 import sys
 import os
 import contextlib
+import time
+import urllib.error
 import urllib.request
 import subprocess
 import json
@@ -63,6 +65,12 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 网络/内核 sysctl 调优脚本（import 与 update-templates.py 共用，单一数据源）
 TUNING_SCRIPT = os.path.join(SCRIPT_DIR, 'uploads', 'apply-net-tuning.sh')
+DOWNLOAD_RETRIES = 3
+RETRIABLE_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
+
+
+class DownloadError(RuntimeError):
+    """镜像下载失败时提供简明、可操作的错误信息。"""
 
 
 class DownloadProgressBar(tqdm.tqdm):
@@ -427,6 +435,45 @@ def save_meta(meta_path: str, data: dict):
         json.dump(data, f)
 
 
+def download_file(name: str, url: str, destination: str):
+    """下载镜像；仅对临时网络和服务端错误进行有限重试。"""
+    for attempt in range(1, DOWNLOAD_RETRIES + 1):
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(destination)
+        try:
+            with DownloadProgressBar(unit="B", unit_scale=True, miniters=1) as t:
+                urllib.request.urlretrieve(url, destination, reporthook=t.update_to)
+            return
+        except urllib.error.HTTPError as exc:
+            retriable = exc.code in RETRIABLE_HTTP_STATUSES
+            detail = f'HTTP {exc.code} {exc.reason}'
+            final_url = exc.geturl()
+            not_found = exc.code == 404
+        except urllib.error.URLError as exc:
+            retriable = True
+            detail = str(exc.reason)
+            final_url = url
+            not_found = False
+
+        if retriable and attempt < DOWNLOAD_RETRIES:
+            delay = 2 ** (attempt - 1)
+            print(f'Download failed ({detail}); retrying in {delay}s '
+                  f'({attempt}/{DOWNLOAD_RETRIES - 1})...')
+            time.sleep(delay)
+            continue
+
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(destination)
+        if not_found:
+            hint = 'The configured image URL no longer exists; update templates.yaml with a current URL.'
+        else:
+            hint = 'Check the URL and the host network/proxy configuration.'
+        raise DownloadError(
+            f'Failed to download template "{name}": {detail}\n'
+            f'URL: {final_url}\n{hint}'
+        ) from None
+
+
 def download_with_cache(name: str, url: str, unpack_cmd: Optional[str] = None, refresh: bool = False) -> str:
     """
     下载镜像（支持缓存比较），必要时解包成 {img}。
@@ -457,10 +504,7 @@ def download_with_cache(name: str, url: str, unpack_cmd: Optional[str] = None, r
             print(f'HEAD check failed: {e}, will download.')
 
     # 开始下载
-    with contextlib.suppress(FileNotFoundError):
-        os.remove(dl)
-    with DownloadProgressBar(unit="B", unit_scale=True, miniters=1) as t:
-        urllib.request.urlretrieve(url, dl, reporthook=t.update_to)
+    download_file(name, url, dl)
 
     # 如果需要解包
     if unpack_cmd:
@@ -546,7 +590,7 @@ def import_template(template: dict, storage: StorageInfo.Base, vmid: int, keep_i
     run(f'qm importdisk {vmid} {img} {storage.name} --format qcow2')
 
     disk = storage.format_disk_name(vmid)
-    run(f'qm set {vmid} --scsihw virtio-scsi-single --scsi0 {storage.name}:{disk},discard=on,ssd=1')
+    run(f'qm set {vmid} --scsihw virtio-scsi-single --scsi0 {storage.name}:{disk},discard=on')
     run(f'qm set {vmid} --boot c --bootdisk scsi0')
     run(f'qm set {vmid} --serial0 socket')
 
@@ -714,4 +758,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except DownloadError as exc:
+        print(f'\nError: {exc}', file=sys.stderr)
+        sys.exit(1)

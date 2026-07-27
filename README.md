@@ -67,7 +67,7 @@ python3 import.py local-lvm 900 'rocky-*' --no-tuning
 
 - `--cpu host,flags=+aes`、`--ostype l26`
 - `--agent enabled=1,fstrim_cloned_disks=1`（启用 QEMU Guest Agent，克隆后自动 fstrim）
-- 系统盘 `virtio-scsi-single` + `discard=on,ssd=1`（支持 TRIM/精简回收）
+- 系统盘 `virtio-scsi-single` + `discard=on`（支持 TRIM/精简回收，不伪装为 SSD）
 - `--net0 virtio,bridge=vmbr0,queues=4`、`--serial0 socket`
 - 启用 cloud-init 时：挂载 cloudinit 盘、`--ciuser root`、`--ipconfig0 ip=dhcp`
 
