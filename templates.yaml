@@ -91,7 +91,7 @@ mirrors:
 templates:
   # ===== Ubuntu =====
   - name: ubuntu-18.04
-    url: https://cloud-images.ubuntu.com/bionic/current/bionic-server-cloudimg-amd64.img
+    url: https://cloud-images.ubuntu.com/releases/bionic/release/ubuntu-18.04-server-cloudimg-amd64.img
     cloud_init: true
     customize:
       uploads:
@@ -101,7 +101,7 @@ templates:
         - ./uploads/install-qga.sh
 
   - name: ubuntu-20.04
-    url: https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img
+    url: https://cloud-images.ubuntu.com/releases/focal/release/ubuntu-20.04-server-cloudimg-amd64.img
     cloud_init: true
     customize:
       uploads:
@@ -142,7 +142,7 @@ templates:
 
   # ===== Debian =====
   - name: debian-10
-    url: https://cloud.debian.org/images/openstack/current-10/debian-10-openstack-amd64.qcow2
+    url: https://cloud.debian.org/images/cloud/buster/latest/debian-10-genericcloud-amd64.qcow2
     cloud_init: true
     customize:
       uploads:
@@ -278,7 +278,7 @@ templates:
   # ===== Fedora Cloud =====
   # Fedora 构建号会随点版本变化（无 -latest 软链），如失效请更新为当前构建号。
   - name: fedora-42
-    url: https://download.fedoraproject.org/pub/fedora/linux/releases/42/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-42-1.1.x86_64.qcow2
+    url: https://archives.fedoraproject.org/pub/archive/fedora/linux/releases/42/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-42-1.1.x86_64.qcow2
     cloud_init: true
     customize:
       uploads:
@@ -289,6 +289,16 @@ templates:
 
   - name: fedora-43
     url: https://download.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2
+    cloud_init: true
+    customize:
+      uploads:
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
+
+  - name: fedora-44
+    url: https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2
     cloud_init: true
     customize:
       uploads:
@@ -308,6 +318,16 @@ templates:
         - ./uploads/permit-root-login.sh
         - ./uploads/install-qga.sh
 
+  - name: opensuse-leap-16.0
+    url: https://download.opensuse.org/distribution/leap/16.0/appliances/Leap-16.0-Minimal-VM.x86_64-Cloud.qcow2
+    cloud_init: true
+    customize:
+      uploads:
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
+
   # ===== Arch Linux =====
   - name: archLinux
     url: https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2
@@ -315,6 +335,18 @@ templates:
     customize:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
+
+  - name: alpineLinux-3.24
+    url: https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/cloud/generic_alpine-3.24.1-x86_64-bios-cloudinit-r0.qcow2
+    cloud_init: true
+    net_tuning: false
+    customize:
+      uploads:
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
+        - ./uploads/resolv.conf:/etc/resolv.conf
       run:
         - ./uploads/permit-root-login.sh
         - ./uploads/install-qga.sh
