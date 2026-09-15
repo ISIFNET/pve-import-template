@@ -25,8 +25,16 @@ curl https://raw.githubusercontent.com/ISIFNET/pve-import-template/refs/heads/ma
 apt install -y git
 git clone https://github.com/ISIFNET/pve-import-template
 cd pve-import-template
-./setup.sh          # 添加 no-subscription 源并安装依赖
+./setup.sh          # 添加 no-subscription 源、安装依赖并检查 TLS/时间同步
 ```
+
+`setup.sh` 同时支持 PVE 8（bookworm）与 PVE 9（trixie）：
+
+- 使用 deb822 格式写入 `/etc/apt/sources.list.d/pve-no-subscription.sources`（已存在则跳过）；
+- 未检测到有效订阅时自动禁用 `enterprise.proxmox.com` 源（否则 PVE 9 上 `apt update` 会因 401 失败）；
+- 安装 `git python3-tqdm python3-yaml libguestfs-tools unzip xz-utils ca-certificates`；
+- 检查 NTP 时间同步与到 `cloud.debian.org` 的 HTTPS 链路，失败时给出排障提示。
+- 环境变量：`SKIP_REPO=1` 不修改 apt 源；`SKIP_CHECKS=1` 跳过检查；`TLS_CHECK_URL` 自定义检查地址。
 
 ## import.py —— 导入模板
 
@@ -48,6 +56,7 @@ python3 import.py <storage-name> <start-vmid> [template-name] [选项]
 | `--refresh` | 忽略缓存，强制重新下载镜像 |
 | `--mirror <name>` | 使用 `templates.yaml` 中配置的镜像源（内网环境） |
 | `--no-tuning` | 本次导入不注入网络/内核 sysctl 调优（默认开启） |
+| `--insecure` | 下载镜像时跳过 TLS 证书校验（仅用于临时绕过证书问题） |
 | `--list` | 列出所有可用模板与镜像源后退出 |
 | `-h, --help` | 显示帮助 |
 
@@ -225,6 +234,16 @@ mirrors:
   - `uploads`：上传文件到镜像（`--upload`）
   - `run`：在镜像内执行宿主机脚本文件（`--run`，相对路径基于脚本目录）
   - `commands`：在镜像内执行的内联命令（`--run-command`）
+
+## 下载镜像时报 `CERTIFICATE_VERIFY_FAILED`
+
+例如 `certificate verify failed: certificate has expired`。这不是镜像站的问题，通常是宿主机环境：
+
+1. **系统时间不准**：`date -R` 核对；`systemctl enable --now chrony && chronyc makestep`。
+2. **CA 证书过期/缺失**：`apt-get install --reinstall ca-certificates && update-ca-certificates`。
+3. **代理拦截 HTTPS**：检查 `http_proxy` / `https_proxy` 环境变量与 `/etc/apt/apt.conf.d/` 中的代理设置。
+
+运行 `./setup.sh` 会自动做上述检查。确认环境无法修复时，可临时加 `--insecure` 跳过校验。
 
 ## 清除已存在的 VM
 

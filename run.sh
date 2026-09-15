@@ -13,16 +13,24 @@ start_vmid="${2:-9000}"
 shift $(( $# > 2 ? 2 : $# )) || true   # 余下参数原样透传给 import.py
 extra_args=("$@")
 
-# 嵌套虚拟化（幂等：避免重复写入 modprobe.conf）
-modprobe -r kvm_intel 2>/dev/null || true
-modprobe kvm_intel nested=1 2>/dev/null || true
-if ! grep -qs 'kvm_intel nested=1' /etc/modprobe.d/modprobe.conf 2>/dev/null; then
-    echo "options kvm_intel nested=1" >> /etc/modprobe.d/modprobe.conf
+# 嵌套虚拟化（按 CPU 厂商选择模块；幂等：避免重复写入 modprobe.conf）
+if grep -qi 'vendor_id.*AuthenticAMD' /proc/cpuinfo; then
+    kvm_mod=kvm_amd
+else
+    kvm_mod=kvm_intel
+fi
+modprobe -r "$kvm_mod" 2>/dev/null || true
+modprobe "$kvm_mod" nested=1 2>/dev/null || true
+if ! grep -qs "^options ${kvm_mod} nested=1" /etc/modprobe.d/*.conf 2>/dev/null; then
+    echo "options ${kvm_mod} nested=1" >> /etc/modprobe.d/kvm-nested.conf
 fi
 
-apt update -y
-apt upgrade -y
-apt install -y curl wget gnupg2 git
+# 只保证 git 可用；apt 源修复、依赖安装与升级统一交给 setup.sh
+# （PVE 9 未订阅时 enterprise 源会让 apt update 返回非 0，这里容忍失败）
+if ! command -v git >/dev/null 2>&1; then
+    apt-get update || true
+    apt-get install -y git
+fi
 
 # 克隆或更新仓库
 if [ -d pve-import-template/.git ]; then

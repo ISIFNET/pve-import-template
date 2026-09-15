@@ -13,6 +13,7 @@ import.py - Proxmox VE Cloud Image Importer
 - 默认保留下载好的镜像文件；--refresh 可强制重下并覆盖缓存
 - 所有外部命令失败会抛出异常（更快发现问题）
 - 支持自定义镜像源：--mirror <mirror-name> 可为内网环境配置软件源
+- TLS 证书校验失败时不再无谓重试，直接给出排障提示；--insecure 可临时跳过校验
 
 用法
   python3 import.py <storage-name> <start-vmid> [template-name[,name2|glob]] [--only-new] [--refresh] [--mirror <mirror-name>]
@@ -43,6 +44,7 @@ import.py - Proxmox VE Cloud Image Importer
 import sys
 import os
 import contextlib
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -71,6 +73,24 @@ RETRIABLE_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
 
 class DownloadError(RuntimeError):
     """镜像下载失败时提供简明、可操作的错误信息。"""
+
+
+TLS_HINT = (
+    'TLS 证书校验失败，常见原因：宿主机时间不准（date -R / chronyc makestep）、\n'
+    'CA 证书过期或缺失（apt-get install --reinstall ca-certificates && update-ca-certificates）、\n'
+    '代理拦截 HTTPS（检查 http_proxy/https_proxy）。运行 ./setup.sh 可自动检查；\n'
+    '临时绕过可加 --insecure（跳过证书校验，不推荐长期使用）。'
+)
+
+
+def disable_tls_verification():
+    """--insecure：为 urllib 安装不校验证书的 HTTPS opener（urlretrieve/urlopen 共用）。"""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    urllib.request.install_opener(
+        urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx)))
+    print('Warning: --insecure 已启用，将跳过镜像下载的 TLS 证书校验。')
 
 
 class DownloadProgressBar(tqdm.tqdm):
@@ -449,11 +469,15 @@ def download_file(name: str, url: str, destination: str):
             detail = f'HTTP {exc.code} {exc.reason}'
             final_url = exc.geturl()
             not_found = exc.code == 404
+            tls_error = False
         except urllib.error.URLError as exc:
-            retriable = True
             detail = str(exc.reason)
             final_url = url
             not_found = False
+            # 证书问题不是瞬时故障，重试没有意义，直接给出排障提示
+            tls_error = (isinstance(exc.reason, ssl.SSLCertVerificationError)
+                         or 'CERTIFICATE_VERIFY_FAILED' in detail)
+            retriable = not tls_error
 
         if retriable and attempt < DOWNLOAD_RETRIES:
             delay = 2 ** (attempt - 1)
@@ -466,6 +490,8 @@ def download_file(name: str, url: str, destination: str):
             os.remove(destination)
         if not_found:
             hint = 'The configured image URL no longer exists; update templates.yaml with a current URL.'
+        elif tls_error:
+            hint = TLS_HINT
         else:
             hint = 'Check the URL and the host network/proxy configuration.'
         raise DownloadError(
@@ -618,6 +644,7 @@ Options:
   --refresh           忽略缓存，强制重新下载镜像
   --mirror <name>     使用 templates.yaml 中配置的镜像源（内网环境）
   --no-tuning         本次导入不注入网络/内核 sysctl 调优（默认开启）
+  --insecure          下载镜像时跳过 TLS 证书校验（仅用于临时绕过证书问题）
   --list              列出 templates.yaml 中所有可用模板后退出
   -h, --help          显示本帮助
 
@@ -687,6 +714,7 @@ def main():
     only_new = False
     refresh = False
     apply_tuning = True
+    insecure = False
     mirror_name = None
     args = sys.argv[3:]
     i = 0
@@ -698,6 +726,8 @@ def main():
             refresh = True
         elif arg == '--no-tuning':
             apply_tuning = False
+        elif arg == '--insecure':
+            insecure = True
         elif arg == '--mirror':
             if i + 1 < len(args):
                 mirror_name = args[i + 1]
@@ -712,6 +742,9 @@ def main():
             print(USAGE)
             sys.exit(1)
         i += 1
+
+    if insecure:
+        disable_tls_verification()
 
     storage = check_storage(storage_name)
 

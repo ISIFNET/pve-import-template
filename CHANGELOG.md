@@ -2,7 +2,30 @@
 
 本文件记录对 pve-import-template 的主要改动。
 
-## [Unreleased] - 2026-07-02
+## [Unreleased] - 2026-09-15
+
+### PVE 9 适配与安装脚本
+
+- **`setup.sh` 重写，支持 PVE 9（Debian trixie）**：不再依赖 `lsb_release` / `add-apt-repository`
+  （PVE 9 默认没有 `lsb_release`，`software-properties-common` 也非必需），改读 `/etc/os-release`，
+  以 deb822 格式写入 `/etc/apt/sources.list.d/pve-no-subscription.sources`，并用
+  `Signed-By` 指向 Proxmox keyring；已有同名源时跳过（幂等）。
+- **无订阅时自动禁用 enterprise 源**：PVE 9 默认启用 `pve-enterprise.sources` / `ceph.sources`，
+  未订阅会导致 `apt update` 返回 401 并让 `set -e` 脚本中止。现通过 `pvesubscription get`
+  判断，仅在无有效订阅时把 `.list` 注释、`.sources` 加 `Enabled: false`。
+- **新增依赖 `ca-certificates`、`xz-utils`**，安装后执行 `update-ca-certificates`。
+- **安装后环境检查**：NTP 同步状态、到 `cloud.debian.org` 的 HTTPS 链路；失败时给出
+  时间 / CA 证书 / 代理三类排障命令。`SKIP_REPO=1`、`SKIP_CHECKS=1`、`TLS_CHECK_URL` 可控制。
+- **`run.sh`**：按 CPU 厂商选择 `kvm_intel` / `kvm_amd` 开启嵌套虚拟化；不再对整机
+  `apt upgrade`（避免一键脚本顺带升级宿主机内核）；仅保证 `git` 可用后即交给 `setup.sh`。
+
+### 下载
+
+- **TLS 证书校验失败不再重试**：`[SSL: CERTIFICATE_VERIFY_FAILED]` 不是瞬时故障，`import.py`
+  现在直接失败并提示检查系统时间 / `ca-certificates` / 代理。
+- 新增 **`--insecure`**：下载镜像时跳过证书校验，作为环境暂时无法修复时的应急手段。
+
+## [0.x] - 2026-07-02
 
 ### 修复
 
