@@ -328,6 +328,17 @@ templates:
         - ./uploads/permit-root-login.sh
         - ./uploads/install-qga.sh
 
+  # openSUSE Leap 16.1 截至 2026-09 仍为预发布（appliances 目录中为 BuildX.Y 快照），正式发布后取消注释。
+  # - name: opensuse-leap-16.1
+  #   url: https://download.opensuse.org/distribution/leap/16.1/appliances/Leap-16.1-Minimal-VM.x86_64-Cloud.qcow2
+  #   cloud_init: true
+  #   customize:
+  #     uploads:
+  #       - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
+  #     run:
+  #       - ./uploads/permit-root-login.sh
+  #       - ./uploads/install-qga.sh
+
   # ===== Arch Linux =====
   - name: archLinux
     url: https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2
@@ -339,23 +350,11 @@ templates:
         - ./uploads/permit-root-login.sh
         - ./uploads/install-qga.sh
 
-  - name: alpineLinux-3.24
-    url: https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/cloud/generic_alpine-3.24.1-x86_64-bios-cloudinit-r0.qcow2
-    cloud_init: true
-    net_tuning: false
-    customize:
-      uploads:
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-        - ./uploads/resolv.conf:/etc/resolv.conf
-      run:
-        - ./uploads/permit-root-login.sh
-        - ./uploads/install-qga.sh
-
   # ===== Alpine Linux =====
   # Alpine 为 musl/openrc 极简镜像：模块加载与 sysctl 行为不同，默认不注入网络调优（net_tuning: false）。
   # qga 通过 apk + openrc 安装（install-qga.sh 已适配）。
   - name: alpineLinux-3.22
-    url: https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/generic_alpine-3.22.1-x86_64-bios-cloudinit-r0.qcow2
+    url: https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/generic_alpine-3.22.5-x86_64-bios-cloudinit-r0.qcow2
     cloud_init: true
     net_tuning: false
     customize:
@@ -367,7 +366,19 @@ templates:
         - ./uploads/install-qga.sh
 
   - name: alpineLinux-3.23
-    url: https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/generic_alpine-3.23.2-x86_64-bios-cloudinit-r0.qcow2
+    url: https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/generic_alpine-3.23.5-x86_64-bios-cloudinit-r0.qcow2
+    cloud_init: true
+    net_tuning: false
+    customize:
+      uploads:
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
+        - ./uploads/resolv.conf:/etc/resolv.conf
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
+
+  - name: alpineLinux-3.24
+    url: https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/cloud/generic_alpine-3.24.1-x86_64-bios-cloudinit-r0.qcow2
     cloud_init: true
     net_tuning: false
     customize:
