@@ -50,6 +50,7 @@ import.py - Proxmox VE Cloud Image Importer
 
 import sys
 import os
+import atexit
 import contextlib
 import ssl
 import time
@@ -98,6 +99,20 @@ FAMILY_LABELS = {
 
 # 模板 VM 默认硬件（可用 --bridge / --memory / --cores 覆盖）
 VM_DEFAULTS = {'bridge': 'vmbr0', 'memory': 512, 'cores': 1}
+
+# 运行期间在宿主机上生成的临时脚本（换源脚本等），结束时统一删除
+_TEMP_FILES: list = []
+
+
+def cleanup_temp_files():
+    """删除本进程生成的宿主机临时脚本（import.py / update-templates.py 共用）。"""
+    while _TEMP_FILES:
+        path = _TEMP_FILES.pop()
+        with contextlib.suppress(OSError):
+            os.remove(path)
+
+
+atexit.register(cleanup_temp_files)
 
 
 def template_family(template: dict) -> str:
@@ -468,13 +483,14 @@ def build_mirror_args(mirror_config: Optional[dict], template_name: str) -> list
         print(f'Warning: Mirror not configured for OS family "{os_family}", skipping.')
         return []
 
-    # 创建临时脚本文件
+    # 创建临时脚本文件（宿主机侧；--run 会把它上传到镜像内执行，宿主机文件在结束时由 cleanup_temp_files 删除）
     script_fd, script_path = tempfile.mkstemp(prefix='mirror_setup_', suffix='.sh')
     try:
         with os.fdopen(script_fd, 'w') as f:
             f.write(mirror_cmd)
         os.chmod(script_path, 0o755)
-        return ['--run', script_path, '--delete', script_path]
+        _TEMP_FILES.append(script_path)
+        return ['--run', script_path]
     except Exception as e:
         print(f'Warning: Failed to create mirror script: {e}')
         with contextlib.suppress(Exception):
@@ -690,6 +706,8 @@ def import_template(template: dict, storage: StorageInfo.Base, vmid: int, keep_i
             print('virt-customize 失败，回退到软件模拟（force_tcg）重试 ...')
             run(['virt-customize', '-a', img, *all_cust_args],
                 LIBGUESTFS_BACKEND='direct', LIBGUESTFS_BACKEND_SETTINGS='force_tcg')
+        finally:
+            cleanup_temp_files()
 
     # 创建 VM 并导入磁盘；任一步失败（含 Ctrl-C）都清理掉半成品 VM，避免留下无盘/无模板标记的残留
     created = False

@@ -80,7 +80,8 @@ python3 tui.py update [选择器...] [update-templates.py 的选项...]
 
 所有参数只作为向导的**默认值**（例如 `python3 tui.py tank 9000 --mirror aliyun`、`python3 tui.py update 'ubuntu-*' --qga`），
 最终以向导里的选择为准。「更新」向导 4 步：勾选目标模板（含已停止的普通 VM）→ 动作（调优 / qga / root 登录）→ 软件源镜像 →
-高级选项（额外脚本 / `--tcg` / `--debug`），确认页同样显示等价的 `update-templates.py` 命令。
+高级选项（额外脚本 / 跳过有链接克隆的模板 / 加锁 / `--tcg` / `--debug`），目标列表会标出链接克隆数，
+确认页同样显示等价的 `update-templates.py` 命令。
 
 | 选项 | 说明 |
 |------|------|
@@ -172,12 +173,21 @@ python3 update-templates.py [选择器 ...] [动作] [选项]
 | `--qga` | 安装并启用 qemu-guest-agent |
 | `--permit-root` | 允许 root SSH 登录 |
 | `--mirror <name>` | 把模板内的软件源换成 `templates.yaml` 中的镜像源（与 `import.py --mirror` 相同逻辑，按模板名识别发行版） |
+| `--reapply` | 按 `templates.yaml` 中同名模板的 `customize`（uploads / run / commands）重新应用一遍 |
 | `--run <script>` | 运行任意宿主机脚本（可重复） |
 
-**选项**：`--vms`（允许选中已停止的普通 VM）、`--node <name>`、`--all-nodes`、`--dry-run`（预演）、`--tcg`（强制软件模拟）、`--debug`（libguestfs 详细日志）、`-y/--yes`（跳过确认）、`--list`、`--tui`（交互式向导）、`-h/--help`
+**选项**：`--vms`（允许选中已停止的普通 VM）、`--skip-cloned`（跳过有链接克隆的模板）、`--no-lock`（修改期间不加 PVE 锁）、
+`--node <name>`、`--all-nodes`、`--dry-run`（预演）、`--tcg`（强制软件模拟）、`--debug`（libguestfs 详细日志）、
+`-y/--yes`（跳过确认）、`--list`（含链接克隆数 / 锁状态）、`--tui`（交互式向导）、`-h/--help`
 
-**失败处理**：某个模板的定制脚本出错只影响该模板（继续处理其余目标，结束时列出失败目标并以非 0 退出）；
-只有 libguestfs appliance 本身起不来（KVM 与软件模拟都失败）才会中止全部，并打印排障步骤。
+**安全措施**：
+- **链接克隆检测**：扫描本节点所有 VM 的磁盘配置，找出基于目标模板的链接克隆（`base-<vmid>-disk`），在目标清单里标出并提示；
+  `--skip-cloned` 可自动跳过这类模板。
+- **修改期间加锁**：对每个目标执行 `qm set --lock clone`，结束后 `qm unlock`，防止修改中途被克隆 / 备份 / 迁移；
+  已经带锁（如 `lock=backup`）的 VM 会被跳过。若脚本被强杀留下锁，手动 `qm unlock <vmid>` 即可。
+- **失败隔离**：某个模板的定制脚本出错只影响该模板（继续处理其余目标，输出保存到 `/tmp/pve-import-template/update-<vmid>-<时间>.log`，
+  结束时列出失败目标并以非 0 退出）；只有 libguestfs appliance 本身起不来（KVM 与软件模拟都失败）才会中止全部并打印排障步骤。
+- 每个目标与整体都会显示耗时；换源用的宿主机临时脚本在结束时自动清理。
 
 ### 示例
 
@@ -185,6 +195,7 @@ python3 update-templates.py [选择器 ...] [动作] [选项]
 python3 update-templates.py --list                     # 列出（本节点）模板及其系统盘
 python3 update-templates.py --tui                      # 交互式选择目标与动作
 python3 update-templates.py 'ubuntu-*' --mirror tsinghua --qga   # 换源后再装 qga
+python3 update-templates.py --all --reapply --skip-cloned        # 重新应用 templates.yaml 定制，跳过有链接克隆的
 python3 update-templates.py --all --dry-run            # 预演：对本节点所有模板应用网络调优
 python3 update-templates.py --all                      # 给本节点所有模板补网络调优
 python3 update-templates.py --all --qga --permit-root  # 同时补 qga + 允许 root
@@ -197,6 +208,10 @@ python3 update-templates.py 9000 9001 -y
 >
 > **LVM/LVM-thin 模板**：PVE 模板基卷（`base-*`）默认未激活，工具会在定制前 `lvchange -ay -K` 激活、
 > 用完后 `lvchange -an` 恢复；无需手动处理。
+>
+> **链接克隆**：`qm clone` 默认在 lvmthin / zfs / dir(qcow2) 上产生链接克隆，它们共享模板基卷。修改基卷后，
+> 已有克隆的运行状态一般不受影响（基卷内容对它们是只读的快照/backing），但仍属于「共享底层被改写」，
+> 建议用 `--list` 先看一眼，重要环境用 `--skip-cloned` 或先做备份。
 >
 > **`guestfs_launch failed`**：多因 KVM 不可用（如 PVE 本身是嵌套虚拟机）。工具会自动回退 `force_tcg`
 > 软件模拟重试；仍失败可加 `--tcg` 全程软件模拟、`--debug` 看详细日志，或 `chmod 0644 /boot/vmlinuz-*`。

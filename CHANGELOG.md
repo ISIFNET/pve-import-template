@@ -17,6 +17,12 @@
   模板选择器新增**系列名**匹配（`rocky,alpine`），`--list` 改为按系列分组显示并标出默认系列。
 - **`import.py` 新选项**：`--bridge` / `--memory` / `--cores`（模板 VM 硬件，原先固定为 vmbr0 / 512 / 1）、
   `--dry-run`（只打印模板与 VMID 分配计划）、`--tui`。`--only-new` 会列出被跳过的模板，全部已存在时直接结束。
+- **`update-templates.py` 安全强化**：新增链接克隆检测（扫描本节点 VM 配置中的 `base-<vmid>-disk`，
+  `--list` / 目标清单 / 向导中标出，`--skip-cloned` 可跳过）；修改期间 `qm set --lock clone`、结束 `qm unlock`
+  （`--no-lock` 关闭），已带锁的 VM 自动跳过；新增 `--reapply`（按 `templates.yaml` 同名模板的 `customize` 重新应用）；
+  失败目标的 virt-customize 输出保存到 `/tmp/pve-import-template/update-<vmid>-<时间>.log`；显示每个目标与整体耗时。
+- **换源临时脚本不再残留**：`import.py` / `update-templates.py` 生成的 `/tmp/mirror_setup_*.sh` 现在会在
+  virt-customize 结束后（以及进程退出时）自动删除；原先的 `--delete` 只作用于镜像内路径。
 - **`update-templates.py` 接入向导并完善**：`tui.py` 入口菜单新增「更新已导入模板」（`python3 tui.py update` /
   `update-templates.py --tui` / `bash run.sh update`）：勾选目标（含已停止的普通 VM）→ 动作 → 软件源镜像 → 高级选项 → 确认。
   新增 `--mirror <name>`（复用 `import.py` 的换源逻辑）；virt-customize 失败按 stderr 区分「appliance 起不来」与

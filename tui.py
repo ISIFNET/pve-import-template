@@ -749,6 +749,7 @@ class UpdateWizard:
         ('tuning', '网络/内核调优：BBR + 大缓冲（--tuning，默认）', True),
         ('qga', '安装并启用 qemu-guest-agent（--qga，需联网）', False),
         ('permit_root', '允许 root SSH 登录（--permit-root）', False),
+        ('reapply', '按 templates.yaml 重新应用该模板的 customize（--reapply）', False),
     )
 
     def __init__(self, ui, pveupdate, mirrors: dict, state: dict, dry_run: bool = False):
@@ -765,6 +766,7 @@ class UpdateWizard:
         self.vms = sorted(vms, key=lambda v: v['vmid'])
         self.targets_pool = [v for v in self.vms
                              if v['template'] == 1 or v['status'] in ('stopped', '')]
+        self.clones = pveupdate.linked_clone_map(self.vms) if hasattr(pveupdate, 'linked_clone_map') else {}
 
     def selected_vms(self) -> List[dict]:
         chosen = set(self.state.get('targets') or [])
@@ -784,12 +786,14 @@ class UpdateWizard:
         for v in self.targets_pool:
             is_tpl = v['template'] == 1
             kind = '模板' if is_tpl else f'VM/{v["status"] or "stopped"}'
-            desc = f'{v["name"]:<24} [{kind}]'
+            cl = self.clones.get(v['vmid'], [])
+            desc = f'{v["name"]:<24} [{kind}]' + (f' ⚠{len(cl)} 个链接克隆' if cl else '')
             checked = (v['vmid'] in prev) if prev else (default_all and is_tpl)
             items.append((str(v['vmid']), desc, checked))
         text = (f'节点：{self.node or "?"}    模板 {sum(1 for v in self.targets_pool if v["template"] == 1)} 个，'
                 f'已停止的普通 VM {sum(1 for v in self.targets_pool if v["template"] != 1)} 个\n'
-                '空格勾选 / 取消，回车确认。普通 VM 需处于停止状态才能修改其系统盘。')
+                '空格勾选 / 取消，回车确认。普通 VM 需处于停止状态才能修改其系统盘。\n'
+                '带「链接克隆」的模板：修改基卷可能影响克隆出的 VM（高级选项里可选择自动跳过）。')
         while True:
             chosen = self.ui.checklist('1/4 选择要更新的模板', text, items)
             if chosen:
@@ -815,11 +819,15 @@ class UpdateWizard:
         st.setdefault('run_script', '')
         st.setdefault('tcg', False)
         st.setdefault('debug', False)
+        st.setdefault('skip_cloned', False)
+        st.setdefault('lock', True)
         while True:
             onoff = lambda key: '是' if st.get(key) else '否'
             items = [
                 ('done', '继续 →'),
                 ('run_script', f'额外脚本   : {st["run_script"] or "（无）"}'),
+                ('skip_cloned', f'跳过有链接克隆的模板 --skip-cloned : {onoff("skip_cloned")}'),
+                ('lock', f'修改期间给 VM 加锁（防止同时克隆/备份）: {onoff("lock")}'),
                 ('tcg', f'强制软件模拟 --tcg : {onoff("tcg")}（KVM 不可用 / 嵌套虚拟化时）'),
                 ('debug', f'libguestfs 调试日志 --debug : {onoff("debug")}'),
             ]
@@ -848,10 +856,16 @@ class UpdateWizard:
             args.append('--qga')
         if st.get('permit_root'):
             args.append('--permit-root')
+        if st.get('reapply'):
+            args.append('--reapply')
         if st.get('mirror'):
             args += ['--mirror', st['mirror']]
         if st.get('run_script'):
             args += ['--run', st['run_script']]
+        if st.get('skip_cloned'):
+            args.append('--skip-cloned')
+        if not st.get('lock', True):
+            args.append('--no-lock')
         if st.get('tcg'):
             args.append('--tcg')
         if st.get('debug'):
@@ -877,13 +891,23 @@ class UpdateWizard:
         lines += textwrap.wrap(', '.join(f'{v["vmid"]}({v["name"]})' for v in vms),
                                width=max(40, min(cols, 96) - 16),
                                initial_indent='         ', subsequent_indent='         ')
+        cloned = [v for v in vms if self.clones.get(v['vmid'])]
+        opt_flags = [x for x in ['--skip-cloned' if st.get('skip_cloned') else '',
+                                 '--no-lock' if not st.get('lock', True) else '',
+                                 '--tcg' if st.get('tcg') else '', '--debug' if st.get('debug') else '',
+                                 '--dry-run' if self.dry_run else ''] if x]
         lines += [
             f'动作   : {", ".join(actions) or "（无）"}',
-            f'选项   : ' + ', '.join(x for x in ['--tcg' if st.get('tcg') else '', '--debug' if st.get('debug') else '',
-                                                 '--dry-run' if self.dry_run else ''] if x) or '默认',
+            f'选项   : {", ".join(opt_flags) or "默认（修改期间加锁）"}',
             '',
-            '⚠ virt-customize 会就地修改模板系统盘；若模板已有链接克隆（lvmthin/zfs 常见），',
-            '  修改基卷可能影响这些克隆，建议先备份/快照。',
+        ]
+        if cloned and not st.get('skip_cloned'):
+            lines += ['⚠ 以下模板有链接克隆，修改基卷可能影响克隆出的 VM（建议先备份/快照）：']
+            lines += textwrap.wrap(', '.join(f'{v["vmid"]}→{",".join(map(str, self.clones[v["vmid"]]))}' for v in cloned),
+                                   width=max(40, min(cols, 96) - 16), initial_indent='  ', subsequent_indent='  ')
+        else:
+            lines += ['⚠ virt-customize 会就地修改模板系统盘，建议对重要模板先备份。']
+        lines += [
             '',
             '等价命令 :',
             f'  {self.command_line()}',
@@ -948,6 +972,9 @@ def parse_update_args(argv):
     parser.add_argument('--no-tuning', action='store_true', default=None)
     parser.add_argument('--qga', action='store_true', default=None)
     parser.add_argument('--permit-root', action='store_true', default=None)
+    parser.add_argument('--reapply', action='store_true', default=None)
+    parser.add_argument('--skip-cloned', action='store_true', default=None)
+    parser.add_argument('--no-lock', action='store_true', default=None)
     parser.add_argument('--mirror')
     parser.add_argument('--run')
     parser.add_argument('--tcg', action='store_true', default=None)
@@ -983,10 +1010,12 @@ def run_update_wizard(argv):
         state['tuning'] = False
     elif args.tuning:
         state['tuning'] = True
-    for key, value in (('qga', args.qga), ('permit_root', args.permit_root),
-                       ('tcg', args.tcg), ('debug', args.debug)):
+    for key, value in (('qga', args.qga), ('permit_root', args.permit_root), ('reapply', args.reapply),
+                       ('skip_cloned', args.skip_cloned), ('tcg', args.tcg), ('debug', args.debug)):
         if value is not None:
             state[key] = value
+    if args.no_lock:
+        state['lock'] = False
     if args.mirror:
         state['mirror'] = args.mirror
     if args.run:

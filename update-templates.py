@@ -31,17 +31,20 @@ update-templates.py - 对「已经导入 PVE 的虚拟机模板」就地重新�
   --qga             安装并启用 qemu-guest-agent
   --permit-root     允许 root SSH 登录
   --mirror <name>   把模板内的软件源换成 templates.yaml 中配置的镜像源（按模板名识别发行版）
+  --reapply         按 templates.yaml 中同名模板的 customize（uploads / run / commands）重新应用一遍
   --run <script>    运行任意宿主机脚本（可重复）
 
 选项
   --vms             允许选中非模板的普通 VM（必须处于 stopped 状态）
+  --skip-cloned     跳过已有链接克隆（linked clone）的模板，避免影响克隆出的 VM
+  --no-lock         修改期间不给 VM 加 PVE 锁（默认加 lock=clone，防止同时被克隆/备份）
   --node <name>     指定作用的 PVE 节点（默认自动识别为本节点）
   --all-nodes       放开节点限制（危险：对非本节点的 VM 执行会失败）
   --dry-run         只打印将执行的操作，不真正修改
   --tcg             强制 libguestfs 用软件模拟启动（KVM 不可用/嵌套虚拟机时）
   --debug           打开 libguestfs 详细日志（排查 guestfs_launch 失败）
   -y, --yes         跳过确认提示
-  --list            列出（本节点）所有模板及其系统盘后退出
+  --list            列出（本节点）所有模板、系统盘与链接克隆数后退出
   --tui             启动交互式向导选择模板与动作（等价于 python3 tui.py update）
   -h, --help        显示帮助
 
@@ -63,16 +66,23 @@ update-templates.py - 对「已经导入 PVE 的虚拟机模板」就地重新�
 
 ⚠ 重要提示
 - virt-customize 会「就地」修改模板系统盘。若该模板已被「链接克隆（linked clone，
-  常见于 lvmthin/zfs）」，修改基卷可能影响这些克隆，请谨慎；建议对重要模板先做备份/快照。
+  常见于 lvmthin/zfs）」，修改基卷可能影响这些克隆。本工具会检测并列出本节点上的链接克隆，
+  可用 --skip-cloned 跳过这类模板；建议对重要模板先做备份/快照。
+- 修改期间会给目标 VM 加 PVE 锁（lock=clone），结束后自动解锁；若中途被强杀留下锁，
+  执行 qm unlock <vmid> 即可。
 - --qga 等需要联网安装软件的动作要求宿主机可访问软件源（或配合内网源）。
+- 失败目标的 virt-customize 输出会保存到 /tmp/pve-import-template/ 下的日志文件。
 """
 
 import os
+import re
 import sys
+import contextlib
 import json
 import fnmatch
 import importlib.util
 import subprocess
+import time
 from typing import Optional
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -85,10 +95,15 @@ PERMIT_ROOT_SCRIPT = os.path.join(UPLOADS, 'permit-root-login.sh')
 # virt-customize 输出中出现这些关键字，说明是 libguestfs appliance 起不来（宿主机环境问题），
 # 而不是某个模板 / 脚本本身的问题
 LAUNCH_FAILURE_MARKERS = ('guestfs_launch', 'appliance', 'supermin', 'could not access KVM', '/dev/kvm')
+LOG_DIR = '/tmp/pve-import-template'
 
 
 class LaunchError(RuntimeError):
     """libguestfs appliance 启动失败（KVM / TCG）。"""
+
+    def __init__(self, message: str, stderr: str = ''):
+        super().__init__(message)
+        self.stderr = stderr
 
 
 def load_import_module():
@@ -155,8 +170,23 @@ def run_virt_customize(path: str, va: list, dry_run: bool, force_tcg: bool = Fal
     if proc.returncode != 0:
         lowered = proc.stderr.lower()
         if any(m.lower() in lowered for m in LAUNCH_FAILURE_MARKERS):
-            raise LaunchError(proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else 'guestfs_launch failed')
+            raise LaunchError(proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else 'guestfs_launch failed',
+                              stderr=proc.stderr)
         raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=proc.stderr)
+
+
+def save_failure_log(vmid: int, name: str, stderr: str) -> Optional[str]:
+    """把失败目标的 virt-customize 输出写入日志文件，返回路径（失败返回 None）。"""
+    if not stderr:
+        return None
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        path = os.path.join(LOG_DIR, f'update-{vmid}-{time.strftime("%Y%m%d-%H%M%S")}.log')
+        with open(path, 'w', encoding='utf-8', errors='replace') as fh:
+            fh.write(f'# {vmid} ({name})\n{stderr}')
+        return path
+    except OSError:
+        return None
 
 
 def preflight_hints() -> list:
@@ -251,6 +281,47 @@ def get_config(vmid: int) -> dict:
             k, v = line.split(':', 1)
             cfg[k.strip()] = v.strip()
     return cfg
+
+
+def linked_clone_map(vms: list) -> dict:
+    """扫描本节点所有非模板 VM 的配置，返回 {模板 VMID: [链接克隆的 VMID, ...]}。
+
+    链接克隆的磁盘卷名里带有 base-<模板 VMID>-disk（lvmthin / zfs / dir 上的 qcow2 backing 都是如此）。
+    """
+    result = {}
+    if not any(v['template'] == 1 for v in vms):
+        return result
+    pattern = re.compile(r'base-(\d+)-disk')
+    for v in vms:
+        if v['template'] == 1:
+            continue
+        cfg = get_config(v['vmid'])
+        for key, val in cfg.items():
+            if not key.startswith(DISK_PREFIXES):
+                continue
+            match = pattern.search(val.split(',')[0])
+            if match:
+                result.setdefault(int(match.group(1)), []).append(v['vmid'])
+    for clones in result.values():
+        clones.sort()
+    return result
+
+
+def vm_lock(vmid: int, dry_run: bool) -> bool:
+    """给 VM 加 PVE 锁（lock=clone），阻止修改期间被克隆 / 备份 / 迁移；失败返回 False。"""
+    try:
+        run(['qm', 'set', str(vmid), '--lock', 'clone'], dry_run=dry_run)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f'  警告：无法加锁（{e}），继续但不受锁保护。')
+        return False
+
+
+def vm_unlock(vmid: int, dry_run: bool):
+    try:
+        run(['qm', 'unlock', str(vmid)], dry_run=dry_run)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print(f'  警告：解锁失败，请手动执行：qm unlock {vmid}')
 
 
 def find_os_disk_volid(cfg: dict) -> Optional[str]:
@@ -370,6 +441,14 @@ def load_mirror_config(mirror_name: Optional[str]):
     return pveimport, mirrors[mirror_name]
 
 
+def template_customize_args(pveimport, config: dict, name: str) -> Optional[list]:
+    """--reapply：返回 templates.yaml 中同名模板的 customize 参数；找不到同名模板返回 None。"""
+    for tpl in config.get('templates', []):
+        if tpl.get('name') == name:
+            return pveimport.build_customize_args(tpl.get('customize'))
+    return None
+
+
 def parse_args(argv):
     selectors = []
     want_all = False
@@ -386,6 +465,9 @@ def parse_args(argv):
     force_tcg = False
     debug = False
     mirror = None
+    reapply = False
+    skip_cloned = False
+    use_lock = True
 
     i = 0
     while i < len(argv):
@@ -423,6 +505,12 @@ def parse_args(argv):
             qga = True
         elif a == '--permit-root':
             permit_root = True
+        elif a == '--reapply':
+            reapply = True
+        elif a == '--skip-cloned':
+            skip_cloned = True
+        elif a == '--no-lock':
+            use_lock = False
         elif a == '--run':
             if i + 1 >= len(argv):
                 print('Error: --run requires a script path.')
@@ -450,7 +538,8 @@ def parse_args(argv):
                 apply_tuning=apply_tuning, qga=qga, permit_root=permit_root,
                 extra_runs=extra_runs, dry_run=dry_run, assume_yes=assume_yes,
                 do_list=do_list, node=node, all_nodes=all_nodes,
-                force_tcg=force_tcg, debug=debug, mirror=mirror)
+                force_tcg=force_tcg, debug=debug, mirror=mirror,
+                reapply=reapply, skip_cloned=skip_cloned, use_lock=use_lock)
 
 
 def print_list(vms: list, scope: str = ''):
@@ -458,13 +547,17 @@ def print_list(vms: list, scope: str = ''):
     if not templates:
         print(f'未发现任何模板 VM{("（" + scope + "）") if scope else ""}。')
         return
+    clones = linked_clone_map(vms)
     print(f'已有模板{("（" + scope + "）") if scope else ""}：')
     for v in sorted(templates, key=lambda x: x['vmid']):
         cfg = get_config(v['vmid'])
         volid = find_os_disk_volid(cfg)
         disk = volid or '(未识别系统盘)'
         node = f" node={v['node']}" if v.get('node') else ''
-        print(f"  {v['vmid']:>6}  {v['name']:<24}{node} disk={disk}")
+        lock = f"  lock={cfg['lock']}" if cfg.get('lock') else ''
+        cl = clones.get(v['vmid'], [])
+        cl_note = f'  链接克隆 {len(cl)} 个：{", ".join(map(str, cl))}' if cl else ''
+        print(f"  {v['vmid']:>6}  {v['name']:<24}{node} disk={disk}{lock}{cl_note}")
 
 
 def main():
@@ -503,8 +596,12 @@ def main():
 
     actions = build_actions(opts['apply_tuning'], opts['qga'], opts['permit_root'], opts['extra_runs'])
     pveimport, mirror_config = load_mirror_config(opts['mirror'])
-    if not actions and not mirror_config:
-        print('没有要执行的动作（用了 --no-tuning 却没指定 --qga/--permit-root/--mirror/--run）。')
+    templates_config = None
+    if opts['reapply']:
+        pveimport = pveimport or load_import_module()
+        templates_config = pveimport.load_config()
+    if not actions and not mirror_config and not opts['reapply']:
+        print('没有要执行的动作（用了 --no-tuning 却没指定 --qga/--permit-root/--mirror/--reapply/--run）。')
         sys.exit(1)
 
     # 校验所用脚本存在
@@ -533,12 +630,34 @@ def main():
         print(f'没有匹配到任何目标（作用范围：{scope}）。')
         sys.exit(1)
 
-    action_labels = ', '.join(([f'mirror:{opts["mirror"]}'] if mirror_config else []) + [label for label, _ in actions])
+    clones = linked_clone_map(node_vms)
+    if opts['skip_cloned']:
+        cloned = [v for v in targets if clones.get(v['vmid'])]
+        if cloned:
+            print('--skip-cloned：跳过有链接克隆的模板：' + ', '.join(f'{v["vmid"]}({v["name"]})' for v in cloned))
+            targets = [v for v in targets if not clones.get(v['vmid'])]
+            if not targets:
+                print('所有匹配的模板都有链接克隆，没有可处理的目标。')
+                sys.exit(1)
+
+    action_labels = ', '.join(([f'mirror:{opts["mirror"]}'] if mirror_config else [])
+                              + (['reapply'] if opts['reapply'] else [])
+                              + [label for label, _ in actions])
     print(f'\n[作用范围：{scope}] 将对以下 {len(targets)} 个目标应用动作 [{action_labels}]：')
+    has_clones = False
     for v in targets:
         kind = '模板' if v['template'] == 1 else f"VM({v['status']})"
-        print(f"  {v['vmid']:>6}  {v['name']:<24} [{kind}]")
-    print('\n⚠ virt-customize 会就地修改系统盘；若存在链接克隆请谨慎，建议先备份。')
+        cl = clones.get(v['vmid'], [])
+        note = f'  ⚠ 链接克隆 {len(cl)} 个：{", ".join(map(str, cl))}' if cl else ''
+        has_clones = has_clones or bool(cl)
+        print(f"  {v['vmid']:>6}  {v['name']:<24} [{kind}]{note}")
+    if has_clones:
+        print('\n⚠ 以上带「链接克隆」的模板：修改基卷可能影响这些克隆出的 VM；'
+              '可用 --skip-cloned 跳过，或先对克隆做备份/快照。')
+    else:
+        print('\n⚠ virt-customize 会就地修改系统盘，建议对重要模板先备份。')
+    if opts['use_lock']:
+        print('  修改期间会给 VM 加 lock=clone，结束后自动解锁（--no-lock 关闭）。')
     for h in preflight_hints():
         print(f'  提示：{h}')
     print()
@@ -555,9 +674,11 @@ def main():
     ok, failed, skipped = 0, 0, 0
     failed_names = []
     guestfs_failed = False
+    started_all = time.time()
     for v in targets:
         vmid, name = v['vmid'], v['name']
         print(f'\n=== {vmid} ({name}) ===')
+        started = time.time()
 
         # 普通 VM 必须 stopped
         if v['template'] != 1 and v['status'] not in ('stopped', ''):
@@ -568,6 +689,10 @@ def main():
         cfg = get_config(vmid)
         if not cfg:
             print('  跳过：无法读取 qm config。')
+            skipped += 1
+            continue
+        if cfg.get('lock'):
+            print(f'  跳过：VM 当前被锁定（lock={cfg["lock"]}），可能正在备份/克隆；确认无误后可 qm unlock {vmid}。')
             skipped += 1
             continue
 
@@ -620,19 +745,34 @@ def main():
                 va += mirror_args
             else:
                 print(f'  提示：镜像源 {opts["mirror"]} 不支持 {name} 的发行版，跳过换源。')
+        if opts['reapply']:
+            reapply_args = template_customize_args(pveimport, templates_config, name)
+            if reapply_args is None:
+                print(f'  提示：templates.yaml 中没有名为 {name} 的模板，跳过 --reapply。')
+            elif reapply_args:
+                va += reapply_args
+            else:
+                print(f'  提示：templates.yaml 中 {name} 没有 customize 配置，跳过 --reapply。')
         for _, args in actions:
             va += args
         if not va:
             print('  跳过：没有适用于该目标的动作。')
             skipped += 1
+            if activated_lv:
+                with contextlib.suppress(subprocess.CalledProcessError, FileNotFoundError):
+                    lv_deactivate(activated_lv, opts['dry_run'])
             continue
+
+        locked = opts['use_lock'] and vm_lock(vmid, opts['dry_run'])
         success = False
         launch_failed = False
+        failure_log = None
         try:
             run_virt_customize(path, va, opts['dry_run'],
                                force_tcg=opts['force_tcg'], debug=opts['debug'])
             success = True
         except subprocess.CalledProcessError as e:
+            failure_log = save_failure_log(vmid, name, e.stderr or '')
             print(f'  失败：virt-customize 退出码 {e.returncode}（该目标的脚本/磁盘问题，继续处理其余目标）。')
         except LaunchError as e:
             # KVM 不可用会导致 guestfs_launch failed；自动回退软件模拟重试一次。
@@ -645,11 +785,18 @@ def main():
                 except LaunchError as e2:
                     print(f'  软件模拟同样失败：{e2}')
                     launch_failed = True
-                except subprocess.CalledProcessError:
+                    failure_log = save_failure_log(vmid, name, e2.stderr)
+                except subprocess.CalledProcessError as e2:
+                    failure_log = save_failure_log(vmid, name, e2.stderr or '')
                     print('  软件模拟下 appliance 可启动，但定制步骤失败（该目标的脚本/磁盘问题）。')
             else:
                 launch_failed = True
+                failure_log = save_failure_log(vmid, name, e.stderr)
         finally:
+            if pveimport is not None:
+                pveimport.cleanup_temp_files()
+            if locked:
+                vm_unlock(vmid, opts['dry_run'])
             # 恢复模板基卷的「未激活」默认状态（仅当本工具激活过它）
             if activated_lv:
                 try:
@@ -657,11 +804,15 @@ def main():
                 except (subprocess.CalledProcessError, FileNotFoundError):
                     print(f'  警告：恢复未激活状态失败：lvchange -an {activated_lv}')
 
+        elapsed = time.time() - started
         if success:
+            print(f'  完成（{elapsed:.0f}s）')
             ok += 1
             continue
         failed += 1
         failed_names.append(f'{vmid}({name})')
+        if failure_log:
+            print(f'  日志：{failure_log}')
         if launch_failed:
             guestfs_failed = True
             # KVM 与软件模拟都失败 → libguestfs appliance 本身起不来（宿主机环境问题），
@@ -673,7 +824,8 @@ def main():
                 skipped += remaining
             break
 
-    print(f'\n完成：成功 {ok}，失败 {failed}，跳过 {skipped}'
+    total_elapsed = time.time() - started_all
+    print(f'\n完成：成功 {ok}，失败 {failed}，跳过 {skipped}，耗时 {total_elapsed:.0f}s'
           f'{"（dry-run，未真正修改）" if opts["dry_run"] else ""}。')
     if failed_names:
         print(f'  失败目标：{", ".join(failed_names)}')
