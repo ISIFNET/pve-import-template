@@ -11,6 +11,8 @@
 #   bash run.sh -y [storage] [vmid] [import.py 参数...]
 #                                                # 非交互：直接导入（默认主流系列 + --only-new）
 #   bash run.sh -y local-lvm 9000 --all          # 非交互导入全部模板
+#   bash run.sh update                           # 更新已导入模板的向导（补调优 / qga / root 登录 / 换源）
+#   bash run.sh -y update --all --qga            # 非交互：等价 python3 update-templates.py --all --qga -y
 #   curl -fsSL <run.sh 地址> | bash -s -- -y local-lvm 9000
 #
 # 选项：
@@ -50,6 +52,7 @@ usage() {
 noninteractive="${NONINTERACTIVE:-0}"
 setup_only=0
 text_ui=0
+mode=''
 positional=()
 extra_args=()
 for arg in "$@"; do
@@ -58,6 +61,13 @@ for arg in "$@"; do
         --setup-only)  setup_only=1 ;;
         --text)        text_ui=1 ;;
         -h|--help)     usage; exit 0 ;;
+        import|update)
+            if [ -z "$mode" ] && [ "${#positional[@]}" -eq 0 ]; then
+                mode="$arg"
+            else
+                positional+=("$arg")
+            fi
+            ;;
         -*)            extra_args+=("$arg") ;;
         *)
             if [ "${#positional[@]}" -lt 3 ] && [ "${#extra_args[@]}" -eq 0 ]; then
@@ -175,19 +185,26 @@ command -v qm >/dev/null 2>&1 || die '未找到 qm：本工具需要在 Proxmox 
 # ---------------------------------------------------------------------------
 # 导入
 # ---------------------------------------------------------------------------
+tui_args=()
+[ -n "$mode" ] && tui_args+=("$mode")
 if [ "$noninteractive" != 1 ]; then
     if [ "$text_ui" = 1 ]; then
         log '启动交互向导（纯文本界面）'
-        exec python3 ./tui.py --text "${positional[@]}" "${extra_args[@]}"
+        exec python3 ./tui.py "${tui_args[@]}" --text "${positional[@]}" "${extra_args[@]}"
     elif have_tty; then
         log '启动交互向导（非交互模式：bash run.sh -y [storage] [vmid] ...）'
         if [ -t 0 ]; then
-            exec python3 ./tui.py "${positional[@]}" "${extra_args[@]}"
+            exec python3 ./tui.py "${tui_args[@]}" "${positional[@]}" "${extra_args[@]}"
         fi
-        exec python3 ./tui.py "${positional[@]}" "${extra_args[@]}" < /dev/tty
+        exec python3 ./tui.py "${tui_args[@]}" "${positional[@]}" "${extra_args[@]}" < /dev/tty
     else
         log '未检测到终端，改为非交互模式'
     fi
+fi
+
+if [ "$mode" = update ]; then
+    log "非交互更新：python3 update-templates.py ${positional[*]} ${extra_args[*]} -y"
+    exec python3 ./update-templates.py "${positional[@]}" "${extra_args[@]}" -y
 fi
 
 storage="${positional[0]:-local-lvm}"

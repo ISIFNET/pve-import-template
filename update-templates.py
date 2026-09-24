@@ -30,6 +30,7 @@ update-templates.py - 对「已经导入 PVE 的虚拟机模板」就地重新�
   --no-tuning       不应用网络/内核调优
   --qga             安装并启用 qemu-guest-agent
   --permit-root     允许 root SSH 登录
+  --mirror <name>   把模板内的软件源换成 templates.yaml 中配置的镜像源（按模板名识别发行版）
   --run <script>    运行任意宿主机脚本（可重复）
 
 选项
@@ -41,6 +42,7 @@ update-templates.py - 对「已经导入 PVE 的虚拟机模板」就地重新�
   --debug           打开 libguestfs 详细日志（排查 guestfs_launch 失败）
   -y, --yes         跳过确认提示
   --list            列出（本节点）所有模板及其系统盘后退出
+  --tui             启动交互式向导选择模板与动作（等价于 python3 tui.py update）
   -h, --help        显示帮助
 
 排障：若报 "guestfs_launch failed"，本工具会自动回退 force_tcg 重试；仍失败见结尾提示，
@@ -52,8 +54,10 @@ update-templates.py - 对「已经导入 PVE 的虚拟机模板」就地重新�
 
 示例
   python3 update-templates.py --list
+  python3 update-templates.py --tui                       # 交互式选择
   python3 update-templates.py --all                       # 给所有模板补网络调优
   python3 update-templates.py --all --qga --permit-root
+  python3 update-templates.py 'ubuntu-*' --mirror tsinghua --qga
   python3 update-templates.py 'ubuntu-*' --dry-run
   python3 update-templates.py 9000 9001 --no-tuning --qga
 
@@ -67,6 +71,7 @@ import os
 import sys
 import json
 import fnmatch
+import importlib.util
 import subprocess
 from typing import Optional
 
@@ -76,6 +81,22 @@ UPLOADS = os.path.join(SCRIPT_DIR, 'uploads')
 TUNING_SCRIPT = os.path.join(UPLOADS, 'apply-net-tuning.sh')
 QGA_SCRIPT = os.path.join(UPLOADS, 'install-qga.sh')
 PERMIT_ROOT_SCRIPT = os.path.join(UPLOADS, 'permit-root-login.sh')
+
+# virt-customize 输出中出现这些关键字，说明是 libguestfs appliance 起不来（宿主机环境问题），
+# 而不是某个模板 / 脚本本身的问题
+LAUNCH_FAILURE_MARKERS = ('guestfs_launch', 'appliance', 'supermin', 'could not access KVM', '/dev/kvm')
+
+
+class LaunchError(RuntimeError):
+    """libguestfs appliance 启动失败（KVM / TCG）。"""
+
+
+def load_import_module():
+    """加载 import.py（文件名与关键字冲突，不能直接 import），复用镜像源换源逻辑。"""
+    spec = importlib.util.spec_from_file_location('pveimport', os.path.join(SCRIPT_DIR, 'import.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 # qm config 中代表磁盘的前缀；EFI / TPM / cloudinit / cdrom 会被跳过
 DISK_PREFIXES = ('scsi', 'virtio', 'sata', 'ide')
@@ -110,6 +131,7 @@ def run(cmd, dry_run: bool = False, **extra_env):
 
 
 def run_virt_customize(path: str, va: list, dry_run: bool, force_tcg: bool = False, debug: bool = False):
+    """运行 virt-customize；失败时按 stderr 区分「appliance 起不来」(LaunchError) 与普通失败。"""
     env = {'LIBGUESTFS_BACKEND': 'direct'}
     if force_tcg:
         # KVM 不可用（如 PVE 本身是嵌套虚拟机）时，强制软件模拟启动 appliance
@@ -117,7 +139,24 @@ def run_virt_customize(path: str, va: list, dry_run: bool, force_tcg: bool = Fal
     if debug:
         env['LIBGUESTFS_DEBUG'] = '1'
         env['LIBGUESTFS_TRACE'] = '1'
-    run(['virt-customize', '-a', path, *va], dry_run=dry_run, **env)
+    cmd = ['virt-customize', '-a', path, *va]
+    print(f'# {cmd}')
+    if dry_run:
+        return
+    full_env = os.environ.copy()
+    full_env.update(env)
+    if debug:
+        # 调试模式下日志量很大，直接透传到终端
+        subprocess.run(cmd, check=True, env=full_env)
+        return
+    proc = subprocess.run(cmd, env=full_env, stderr=subprocess.PIPE, text=True, errors='replace')
+    if proc.stderr.strip():
+        print(proc.stderr.rstrip(), file=sys.stderr)
+    if proc.returncode != 0:
+        lowered = proc.stderr.lower()
+        if any(m.lower() in lowered for m in LAUNCH_FAILURE_MARKERS):
+            raise LaunchError(proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else 'guestfs_launch failed')
+        raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=proc.stderr)
 
 
 def preflight_hints() -> list:
@@ -319,6 +358,18 @@ def build_actions(apply_tuning: bool, qga: bool, permit_root: bool, extra_runs: 
     return actions
 
 
+def load_mirror_config(mirror_name: Optional[str]):
+    """返回 (import 模块, 镜像源配置)；未指定 --mirror 时返回 (None, None)。"""
+    if not mirror_name:
+        return None, None
+    pveimport = load_import_module()
+    mirrors = pveimport.load_config().get('mirrors', {}) or {}
+    if mirror_name not in mirrors:
+        print(f'Error: 镜像源 "{mirror_name}" 不在 templates.yaml 中。可用：{", ".join(mirrors) or "(无)"}')
+        sys.exit(1)
+    return pveimport, mirrors[mirror_name]
+
+
 def parse_args(argv):
     selectors = []
     want_all = False
@@ -334,6 +385,7 @@ def parse_args(argv):
     all_nodes = False
     force_tcg = False
     debug = False
+    mirror = None
 
     i = 0
     while i < len(argv):
@@ -341,6 +393,10 @@ def parse_args(argv):
         if a in ('-h', '--help'):
             print(__doc__)
             sys.exit(0)
+        elif a == '--tui':
+            tui = os.path.join(SCRIPT_DIR, 'tui.py')
+            rest = [x for x in argv if x != '--tui']
+            os.execv(sys.executable, [sys.executable, tui, 'update', *rest])
         elif a == '--all':
             want_all = True
         elif a == '--node':
@@ -348,6 +404,12 @@ def parse_args(argv):
                 print('Error: --node requires a node name.')
                 sys.exit(1)
             node = argv[i + 1]
+            i += 1
+        elif a == '--mirror':
+            if i + 1 >= len(argv):
+                print('Error: --mirror requires a mirror name.')
+                sys.exit(1)
+            mirror = argv[i + 1]
             i += 1
         elif a == '--all-nodes':
             all_nodes = True
@@ -388,7 +450,7 @@ def parse_args(argv):
                 apply_tuning=apply_tuning, qga=qga, permit_root=permit_root,
                 extra_runs=extra_runs, dry_run=dry_run, assume_yes=assume_yes,
                 do_list=do_list, node=node, all_nodes=all_nodes,
-                force_tcg=force_tcg, debug=debug)
+                force_tcg=force_tcg, debug=debug, mirror=mirror)
 
 
 def print_list(vms: list, scope: str = ''):
@@ -440,8 +502,9 @@ def main():
         sys.exit(1)
 
     actions = build_actions(opts['apply_tuning'], opts['qga'], opts['permit_root'], opts['extra_runs'])
-    if not actions:
-        print('没有要执行的动作（用了 --no-tuning 却没指定 --qga/--permit-root/--run）。')
+    pveimport, mirror_config = load_mirror_config(opts['mirror'])
+    if not actions and not mirror_config:
+        print('没有要执行的动作（用了 --no-tuning 却没指定 --qga/--permit-root/--mirror/--run）。')
         sys.exit(1)
 
     # 校验所用脚本存在
@@ -470,7 +533,7 @@ def main():
         print(f'没有匹配到任何目标（作用范围：{scope}）。')
         sys.exit(1)
 
-    action_labels = ', '.join(label for label, _ in actions)
+    action_labels = ', '.join(([f'mirror:{opts["mirror"]}'] if mirror_config else []) + [label for label, _ in actions])
     print(f'\n[作用范围：{scope}] 将对以下 {len(targets)} 个目标应用动作 [{action_labels}]：')
     for v in targets:
         kind = '模板' if v['template'] == 1 else f"VM({v['status']})"
@@ -490,6 +553,7 @@ def main():
             return
 
     ok, failed, skipped = 0, 0, 0
+    failed_names = []
     guestfs_failed = False
     for v in targets:
         vmid, name = v['vmid'], v['name']
@@ -549,22 +613,42 @@ def main():
                 continue
 
         va = []
+        if mirror_config:
+            # 换源脚本按模板名识别发行版；不支持的发行版会返回空列表（跳过换源）
+            mirror_args = pveimport.build_mirror_args(mirror_config, name)
+            if mirror_args:
+                va += mirror_args
+            else:
+                print(f'  提示：镜像源 {opts["mirror"]} 不支持 {name} 的发行版，跳过换源。')
         for _, args in actions:
             va += args
+        if not va:
+            print('  跳过：没有适用于该目标的动作。')
+            skipped += 1
+            continue
         success = False
+        launch_failed = False
         try:
             run_virt_customize(path, va, opts['dry_run'],
                                force_tcg=opts['force_tcg'], debug=opts['debug'])
             success = True
-        except subprocess.CalledProcessError:
+        except subprocess.CalledProcessError as e:
+            print(f'  失败：virt-customize 退出码 {e.returncode}（该目标的脚本/磁盘问题，继续处理其余目标）。')
+        except LaunchError as e:
             # KVM 不可用会导致 guestfs_launch failed；自动回退软件模拟重试一次。
+            print(f'  appliance 启动失败：{e}')
             if not opts['force_tcg'] and not opts['dry_run']:
                 print('  virt-customize 失败，回退到软件模拟（force_tcg）重试 ...')
                 try:
                     run_virt_customize(path, va, opts['dry_run'], force_tcg=True, debug=opts['debug'])
                     success = True
+                except LaunchError as e2:
+                    print(f'  软件模拟同样失败：{e2}')
+                    launch_failed = True
                 except subprocess.CalledProcessError:
-                    pass
+                    print('  软件模拟下 appliance 可启动，但定制步骤失败（该目标的脚本/磁盘问题）。')
+            else:
+                launch_failed = True
         finally:
             # 恢复模板基卷的「未激活」默认状态（仅当本工具激活过它）
             if activated_lv:
@@ -575,8 +659,10 @@ def main():
 
         if success:
             ok += 1
-        else:
-            failed += 1
+            continue
+        failed += 1
+        failed_names.append(f'{vmid}({name})')
+        if launch_failed:
             guestfs_failed = True
             # KVM 与软件模拟都失败 → libguestfs appliance 本身起不来（宿主机环境问题），
             # 会影响所有目标，继续尝试其余模板没有意义，直接中止。
@@ -589,9 +675,17 @@ def main():
 
     print(f'\n完成：成功 {ok}，失败 {failed}，跳过 {skipped}'
           f'{"（dry-run，未真正修改）" if opts["dry_run"] else ""}。')
+    if failed_names:
+        print(f'  失败目标：{", ".join(failed_names)}')
     if guestfs_failed:
         print_guestfs_hints()
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('\n已中断。', file=sys.stderr)
+        sys.exit(130)

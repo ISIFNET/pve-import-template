@@ -4,7 +4,7 @@
 
 包含三个工具：
 
-- **`tui.py`** —— 交互式导入向导（`run.sh` 默认入口）：选存储、起始 VMID、系统模板与各项选项，最后调用 `import.py`。
+- **`tui.py`** —— 交互式向导（`run.sh` 默认入口）：入口菜单选「导入新模板」或「更新已导入模板」，一步步选择后调用下面两个工具。
 - **`import.py`** —— 下载云镜像、离线定制、创建并转换为 PVE 模板。默认只导入主流系列（Ubuntu / Debian / CentOS Stream / Alpine），其余系列按需选择。
 - **`update-templates.py`** —— 对**已经导入**的模板就地重新应用定制（网络调优 / qemu-guest-agent / 允许 root 登录等），**无需重新下载或重建模板**。
 
@@ -20,7 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/ISIFNET/pve-import-template/refs/he
 wget -O - https://raw.githubusercontent.com/ISIFNET/pve-import-template/refs/heads/master/run.sh | bash
 ```
 
-`run.sh` 会克隆/更新仓库、按需运行 `setup.sh`，然后打开**交互式向导**（`tui.py`）：
+`run.sh` 会克隆/更新仓库、按需运行 `setup.sh`，然后打开**交互式向导**（`tui.py`）。入口菜单选「导入新模板」后：
 
 1. 选择存储（自动列出支持 `images` 的存储及剩余空间）
 2. 起始 VMID（已占用会提示并自动跳过）
@@ -38,6 +38,8 @@ bash run.sh                         # 交互向导
 bash run.sh local-lvm 9000          # 向导，预填存储 / 起始 VMID
 bash run.sh -y                      # 非交互：主流系列 + --only-new，storage=local-lvm，vmid 从 9000 开始
 bash run.sh -y tank 9000 --all      # 非交互：导入全部模板
+bash run.sh update                  # 更新已导入模板的向导（见下文 update-templates.py）
+bash run.sh -y update --all --qga   # 非交互更新：等价 python3 update-templates.py --all --qga -y
 bash run.sh --setup-only            # 只准备环境
 curl -fsSL .../run.sh | bash -s -- -y local-lvm 9000
 ```
@@ -71,10 +73,14 @@ python3 tui.py      # 或直接 python3 import.py <storage> <start-vmid> ...
 ## tui.py —— 交互式向导
 
 ```bash
-python3 tui.py [storage] [start-vmid] [template-selector] [import.py 的选项...] [--text] [--dry-run] [--no-save]
+python3 tui.py                                   # 入口菜单：导入新模板 / 更新已导入模板
+python3 tui.py import [storage] [start-vmid] [template-selector] [import.py 的选项...]
+python3 tui.py update [选择器...] [update-templates.py 的选项...]
 ```
 
-所有参数只作为向导的**默认值**（例如 `python3 tui.py tank 9000 --mirror aliyun`），最终以向导里的选择为准。
+所有参数只作为向导的**默认值**（例如 `python3 tui.py tank 9000 --mirror aliyun`、`python3 tui.py update 'ubuntu-*' --qga`），
+最终以向导里的选择为准。「更新」向导 4 步：勾选目标模板（含已停止的普通 VM）→ 动作（调优 / qga / root 登录）→ 软件源镜像 →
+高级选项（额外脚本 / `--tcg` / `--debug`），确认页同样显示等价的 `update-templates.py` 命令。
 
 | 选项 | 说明 |
 |------|------|
@@ -165,14 +171,20 @@ python3 update-templates.py [选择器 ...] [动作] [选项]
 | `--tuning` / `--no-tuning` | 应用 / 不应用网络/内核调优（默认应用） |
 | `--qga` | 安装并启用 qemu-guest-agent |
 | `--permit-root` | 允许 root SSH 登录 |
+| `--mirror <name>` | 把模板内的软件源换成 `templates.yaml` 中的镜像源（与 `import.py --mirror` 相同逻辑，按模板名识别发行版） |
 | `--run <script>` | 运行任意宿主机脚本（可重复） |
 
-**选项**：`--vms`（允许选中已停止的普通 VM）、`--node <name>`、`--all-nodes`、`--dry-run`（预演）、`--tcg`（强制软件模拟）、`--debug`（libguestfs 详细日志）、`-y/--yes`（跳过确认）、`--list`、`-h/--help`
+**选项**：`--vms`（允许选中已停止的普通 VM）、`--node <name>`、`--all-nodes`、`--dry-run`（预演）、`--tcg`（强制软件模拟）、`--debug`（libguestfs 详细日志）、`-y/--yes`（跳过确认）、`--list`、`--tui`（交互式向导）、`-h/--help`
+
+**失败处理**：某个模板的定制脚本出错只影响该模板（继续处理其余目标，结束时列出失败目标并以非 0 退出）；
+只有 libguestfs appliance 本身起不来（KVM 与软件模拟都失败）才会中止全部，并打印排障步骤。
 
 ### 示例
 
 ```bash
 python3 update-templates.py --list                     # 列出（本节点）模板及其系统盘
+python3 update-templates.py --tui                      # 交互式选择目标与动作
+python3 update-templates.py 'ubuntu-*' --mirror tsinghua --qga   # 换源后再装 qga
 python3 update-templates.py --all --dry-run            # 预演：对本节点所有模板应用网络调优
 python3 update-templates.py --all                      # 给本节点所有模板补网络调优
 python3 update-templates.py --all --qga --permit-root  # 同时补 qga + 允许 root

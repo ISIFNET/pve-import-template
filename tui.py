@@ -12,7 +12,10 @@ tui.py - pve-import-template 交互式导入向导
 - 通过管道执行（curl ... | bash）时会自动接管 /dev/tty。
 
 用法
-  python3 tui.py [storage] [start-vmid] [template-filter] [import.py 的选项...] [--text] [--dry-run]
+  python3 tui.py                       # 入口菜单：导入新模板 / 更新已导入的模板
+  python3 tui.py import [storage] [start-vmid] [template-filter] [import.py 的选项...]
+  python3 tui.py update [选择器...] [update-templates.py 的选项...]
+  通用选项：--text（纯文本界面）、--dry-run、--no-save（不记住选择）
   （所有参数只作为向导的默认值，最终以向导里的选择为准）
 """
 
@@ -30,6 +33,7 @@ from typing import List, Optional, Sequence, Tuple
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 IMPORT_PY = os.path.join(SCRIPT_DIR, 'import.py')
+UPDATE_PY = os.path.join(SCRIPT_DIR, 'update-templates.py')
 STATE_FILE = os.path.expanduser('~/.config/pve-import-template/last.json')
 
 MIRROR_LABELS = {
@@ -46,12 +50,20 @@ PRESET_FAMILY = 'family'
 PRESET_CUSTOM = 'custom'
 
 
-def load_import_module():
-    """把 import.py 作为模块加载（文件名与关键字冲突，不能直接 import）。"""
-    spec = importlib.util.spec_from_file_location('pveimport', IMPORT_PY)
+def load_module(name: str, path: str):
+    """按路径加载脚本为模块（import.py / update-templates.py 的文件名都不能直接 import）。"""
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def load_import_module():
+    return load_module('pveimport', IMPORT_PY)
+
+
+def load_update_module():
+    return load_module('pveupdate', UPDATE_PY)
 
 
 class Cancel(Exception):
@@ -369,6 +381,20 @@ def save_state(state: dict):
         pass
 
 
+def mirror_menu(ui, mirrors: dict, current: Optional[str], title: str, text: str) -> Optional[str]:
+    """镜像源选择菜单（导入 / 更新向导共用）；返回镜像名或 None。"""
+    items = [('none', '不换源（使用各发行版官方源）')]
+    for name, cfg in mirrors.items():
+        fams = ', '.join(k for k in cfg.keys() if isinstance(cfg.get(k), dict)) if isinstance(cfg, dict) else ''
+        label = MIRROR_LABELS.get(name, name)
+        items.append((name, f'{label:<14} {name:<10} 支持: {fams}'))
+    default = current or 'none'
+    if default not in [i[0] for i in items]:
+        default = 'none'
+    choice = ui.menu(title, text, items, default=default)
+    return None if choice == 'none' else choice
+
+
 # ---------------------------------------------------------------------------
 # 向导
 # ---------------------------------------------------------------------------
@@ -588,18 +614,9 @@ class Wizard:
 
     def step_mirror(self):
         st = self.state
-        items = [('none', '不换源（使用各发行版官方源）')]
-        for name, cfg in self.mirrors.items():
-            fams = ', '.join(k for k in cfg.keys() if isinstance(cfg.get(k), dict)) if isinstance(cfg, dict) else ''
-            label = MIRROR_LABELS.get(name, name)
-            items.append((name, f'{label:<14} {name:<10} 支持: {fams}'))
-        default = st.get('mirror') or 'none'
-        if default not in [i[0] for i in items]:
-            default = 'none'
         text = ('可选：导入时把镜像内的软件源替换为国内/内网镜像（在 templates.yaml 的 mirrors 中配置）。\n'
                 '仅影响模板内的 apt/yum/apk 源，不影响镜像文件的下载地址。')
-        choice = self.ui.menu('5/6 软件源镜像', text, items, default=default)
-        st['mirror'] = None if choice == 'none' else choice
+        st['mirror'] = mirror_menu(self.ui, self.mirrors, st.get('mirror'), '5/6 软件源镜像', text)
 
     def step_vm(self):
         st = self.state
@@ -725,8 +742,269 @@ class Wizard:
 
 
 # ---------------------------------------------------------------------------
+# 更新已导入模板的向导（update-templates.py）
+# ---------------------------------------------------------------------------
+class UpdateWizard:
+    ACTION_ITEMS = (
+        ('tuning', '网络/内核调优：BBR + 大缓冲（--tuning，默认）', True),
+        ('qga', '安装并启用 qemu-guest-agent（--qga，需联网）', False),
+        ('permit_root', '允许 root SSH 登录（--permit-root）', False),
+    )
+
+    def __init__(self, ui, pveupdate, mirrors: dict, state: dict, dry_run: bool = False):
+        self.ui = ui
+        self.pveupdate = pveupdate
+        self.mirrors = mirrors
+        self.state = state
+        self.dry_run = dry_run
+        self.printed = False
+        self.node = pveupdate.local_node_name() or ''
+        vms = pveupdate.list_vms()
+        if self.node:
+            vms = [v for v in vms if (v.get('node') or self.node) == self.node]
+        self.vms = sorted(vms, key=lambda v: v['vmid'])
+        self.targets_pool = [v for v in self.vms
+                             if v['template'] == 1 or v['status'] in ('stopped', '')]
+
+    def selected_vms(self) -> List[dict]:
+        chosen = set(self.state.get('targets') or [])
+        return [v for v in self.targets_pool if v['vmid'] in chosen]
+
+    # ---- 步骤 ----
+    def step_targets(self):
+        st = self.state
+        if not self.targets_pool:
+            self.ui.msgbox('没有可更新的目标',
+                           f'节点 {self.node or "?"} 上没有模板，也没有已停止的 VM。\n'
+                           '请先用「导入新模板」创建模板。')
+            raise Cancel()
+        prev = set(st.get('targets') or [])
+        default_all = not prev
+        items = []
+        for v in self.targets_pool:
+            is_tpl = v['template'] == 1
+            kind = '模板' if is_tpl else f'VM/{v["status"] or "stopped"}'
+            desc = f'{v["name"]:<24} [{kind}]'
+            checked = (v['vmid'] in prev) if prev else (default_all and is_tpl)
+            items.append((str(v['vmid']), desc, checked))
+        text = (f'节点：{self.node or "?"}    模板 {sum(1 for v in self.targets_pool if v["template"] == 1)} 个，'
+                f'已停止的普通 VM {sum(1 for v in self.targets_pool if v["template"] != 1)} 个\n'
+                '空格勾选 / 取消，回车确认。普通 VM 需处于停止状态才能修改其系统盘。')
+        while True:
+            chosen = self.ui.checklist('1/4 选择要更新的模板', text, items)
+            if chosen:
+                st['targets'] = [int(c) for c in chosen]
+                return
+            self.ui.msgbox('未选择目标', '至少需要勾选一个模板或 VM。')
+
+    def step_actions(self):
+        st = self.state
+        items = [(key, desc, st.get(key, default)) for key, desc, default in self.ACTION_ITEMS]
+        chosen = set(self.ui.checklist('2/4 选择动作', '将对每个目标的系统盘依次执行以下动作：', items))
+        for key, _, _ in self.ACTION_ITEMS:
+            st[key] = key in chosen
+
+    def step_mirror(self):
+        st = self.state
+        text = ('可选：把模板内的软件源替换为国内/内网镜像（按模板名识别发行版，\n'
+                '不支持的发行版会跳过换源）。')
+        st['mirror'] = mirror_menu(self.ui, self.mirrors, st.get('mirror'), '3/4 软件源镜像', text)
+
+    def step_options(self):
+        st = self.state
+        st.setdefault('run_script', '')
+        st.setdefault('tcg', False)
+        st.setdefault('debug', False)
+        while True:
+            onoff = lambda key: '是' if st.get(key) else '否'
+            items = [
+                ('done', '继续 →'),
+                ('run_script', f'额外脚本   : {st["run_script"] or "（无）"}'),
+                ('tcg', f'强制软件模拟 --tcg : {onoff("tcg")}（KVM 不可用 / 嵌套虚拟化时）'),
+                ('debug', f'libguestfs 调试日志 --debug : {onoff("debug")}'),
+            ]
+            choice = self.ui.menu('4/4 高级选项', '一般保持默认即可。', items, default='done')
+            if choice == 'done':
+                return
+            if choice == 'run_script':
+                value = self.ui.inputbox('额外脚本', '在镜像内额外执行的宿主机脚本路径（留空表示不执行）：',
+                                         st['run_script'])
+                if value and not os.path.exists(value if os.path.isabs(value) else os.path.join(SCRIPT_DIR, value)):
+                    self.ui.msgbox('文件不存在', f'找不到脚本：{value}')
+                    continue
+                st['run_script'] = value
+            else:
+                st[choice] = not st.get(choice)
+
+    def build_args(self) -> List[str]:
+        st = self.state
+        vms = self.selected_vms()
+        args = [str(v['vmid']) for v in vms]
+        if any(v['template'] != 1 for v in vms):
+            args.append('--vms')
+        if not st.get('tuning', True):
+            args.append('--no-tuning')
+        if st.get('qga'):
+            args.append('--qga')
+        if st.get('permit_root'):
+            args.append('--permit-root')
+        if st.get('mirror'):
+            args += ['--mirror', st['mirror']]
+        if st.get('run_script'):
+            args += ['--run', st['run_script']]
+        if st.get('tcg'):
+            args.append('--tcg')
+        if st.get('debug'):
+            args.append('--debug')
+        if self.dry_run:
+            args.append('--dry-run')
+        args.append('-y')
+        return args
+
+    def command_line(self) -> str:
+        return 'python3 update-templates.py ' + ' '.join(shlex.quote(a) for a in self.build_args())
+
+    def summary_text(self) -> str:
+        st = self.state
+        vms = self.selected_vms()
+        actions = [desc.split('（')[0] for key, desc, _ in self.ACTION_ITEMS if st.get(key, key == 'tuning')]
+        if st.get('mirror'):
+            actions.append(f'换源:{st["mirror"]}')
+        if st.get('run_script'):
+            actions.append(f'脚本:{os.path.basename(st["run_script"])}')
+        cols, _ = shutil.get_terminal_size((80, 24))
+        lines = [f'目标   : {len(vms)} 个（节点 {self.node or "?"}）']
+        lines += textwrap.wrap(', '.join(f'{v["vmid"]}({v["name"]})' for v in vms),
+                               width=max(40, min(cols, 96) - 16),
+                               initial_indent='         ', subsequent_indent='         ')
+        lines += [
+            f'动作   : {", ".join(actions) or "（无）"}',
+            f'选项   : ' + ', '.join(x for x in ['--tcg' if st.get('tcg') else '', '--debug' if st.get('debug') else '',
+                                                 '--dry-run' if self.dry_run else ''] if x) or '默认',
+            '',
+            '⚠ virt-customize 会就地修改模板系统盘；若模板已有链接克隆（lvmthin/zfs 常见），',
+            '  修改基卷可能影响这些克隆，建议先备份/快照。',
+            '',
+            '等价命令 :',
+            f'  {self.command_line()}',
+        ]
+        return '\n'.join(lines)
+
+    def run(self) -> Optional[List[str]]:
+        steps = [self.step_targets, self.step_actions, self.step_mirror, self.step_options]
+        idx = 0
+        while idx < len(steps):
+            try:
+                steps[idx]()
+                idx += 1
+            except Cancel:
+                if idx == 0:
+                    return None
+                idx -= 1
+        if not any(self.state.get(k, k == 'tuning') for k, _, _ in self.ACTION_ITEMS) \
+                and not self.state.get('mirror') and not self.state.get('run_script'):
+            self.ui.msgbox('没有动作', '至少需要选择一个动作（调优 / qga / root 登录 / 换源 / 脚本）。')
+            return self.run()
+
+        edit_items = [
+            ('start', '开始更新' + ('（--dry-run，仅打印）' if self.dry_run else '')),
+            ('targets', '修改：目标模板'),
+            ('actions', '修改：动作'),
+            ('mirror', '修改：软件源镜像'),
+            ('options', '修改：高级选项'),
+            ('print', '仅打印等价命令并退出'),
+            ('quit', '退出'),
+        ]
+        editors = {'targets': self.step_targets, 'actions': self.step_actions,
+                   'mirror': self.step_mirror, 'options': self.step_options}
+        while True:
+            try:
+                choice = self.ui.menu('确认更新', self.summary_text(), edit_items, default='start', cancel_label='退出')
+            except Cancel:
+                choice = 'quit'
+            if choice == 'start':
+                return self.build_args()
+            if choice == 'print':
+                self.printed = True
+                print(self.command_line())
+                return None
+            if choice == 'quit':
+                return None
+            try:
+                editors[choice]()
+            except Cancel:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
+def parse_update_args(argv):
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('selectors', nargs='*')
+    parser.add_argument('--all', action='store_true')
+    parser.add_argument('--vms', action='store_true')
+    parser.add_argument('--tuning', action='store_true', default=None)
+    parser.add_argument('--no-tuning', action='store_true', default=None)
+    parser.add_argument('--qga', action='store_true', default=None)
+    parser.add_argument('--permit-root', action='store_true', default=None)
+    parser.add_argument('--mirror')
+    parser.add_argument('--run')
+    parser.add_argument('--tcg', action='store_true', default=None)
+    parser.add_argument('--debug', action='store_true', default=None)
+    parser.add_argument('--node')
+    parser.add_argument('--all-nodes', action='store_true')
+    parser.add_argument('-y', '--yes', action='store_true')
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--text', action='store_true')
+    parser.add_argument('--no-save', action='store_true')
+    parser.add_argument('-h', '--help', action='store_true')
+    return parser.parse_args(argv)
+
+
+def run_update_wizard(argv):
+    args = parse_update_args(argv)
+    if args.help:
+        print(__doc__.strip())
+        return
+    ensure_tty(args.text)
+    ui = pick_ui(args.text)
+    pveupdate = load_update_module()
+    pveimport = load_import_module()
+    mirrors = pveimport.load_config().get('mirrors', {}) or {}
+
+    full_state = load_state()
+    state = dict(full_state.get('update') or {})
+    if args.selectors or args.all:
+        vms = pveupdate.list_vms()
+        picked = pveupdate.select_targets(vms, args.selectors, args.all, args.vms)
+        state['targets'] = [v['vmid'] for v in picked]
+    if args.no_tuning:
+        state['tuning'] = False
+    elif args.tuning:
+        state['tuning'] = True
+    for key, value in (('qga', args.qga), ('permit_root', args.permit_root),
+                       ('tcg', args.tcg), ('debug', args.debug)):
+        if value is not None:
+            state[key] = value
+    if args.mirror:
+        state['mirror'] = args.mirror
+    if args.run:
+        state['run_script'] = args.run
+
+    wizard = UpdateWizard(ui, pveupdate, mirrors, state, dry_run=args.dry_run)
+    update_args = wizard.run()
+    if update_args is None:
+        if not wizard.printed:
+            print('已取消，未做任何更改。')
+        return
+    if not args.no_save:
+        full_state['update'] = {k: v for k, v in state.items() if k not in ('debug',)}
+        save_state(full_state)
+    print(f'\n==> {wizard.command_line()}\n')
+    os.execv(sys.executable, [sys.executable, UPDATE_PY, *update_args])
+
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('storage', nargs='?')
@@ -748,8 +1026,41 @@ def parse_args(argv):
     return parser.parse_args(argv)
 
 
+def choose_mode(force_text: bool) -> Optional[str]:
+    """入口菜单：导入新模板 / 更新已导入的模板。"""
+    ensure_tty(force_text)
+    ui = pick_ui(force_text)
+    items = [
+        ('import', '导入新模板     下载云镜像 → 定制 → 创建 PVE 模板'),
+        ('update', '更新已导入模板 对现有模板就地补调优 / qga / root 登录 / 换源'),
+        ('quit', '退出'),
+    ]
+    try:
+        choice = ui.menu('pve-import-template', f'节点：{local_node_name() or "?"}    {pve_version()}\n请选择要做的事情：',
+                         items, default='import', cancel_label='退出')
+    except Cancel:
+        return None
+    return None if choice == 'quit' else choice
+
+
 def main():
-    args = parse_args(sys.argv[1:])
+    argv = sys.argv[1:]
+    mode = None
+    if argv and argv[0] in ('import', 'update'):
+        mode = argv.pop(0)
+    elif not any(a in ('-h', '--help') for a in argv) and not [a for a in argv if not a.startswith('-')]:
+        mode = choose_mode('--text' in argv)
+        if mode is None:
+            print('已退出。')
+            return
+    else:
+        mode = 'import'
+
+    if mode == 'update':
+        run_update_wizard(argv)
+        return
+
+    args = parse_args(argv)
     if args.help:
         print(__doc__.strip())
         return
@@ -759,7 +1070,8 @@ def main():
     config = pveimport.load_config()
     ui = pick_ui(args.text)
 
-    state = load_state()
+    full_state = load_state()
+    state = full_state
     if args.storage:
         state['storage'] = args.storage
     if args.start_vmid and str(args.start_vmid).isdigit():

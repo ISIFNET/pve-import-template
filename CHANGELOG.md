@@ -17,10 +17,15 @@
   模板选择器新增**系列名**匹配（`rocky,alpine`），`--list` 改为按系列分组显示并标出默认系列。
 - **`import.py` 新选项**：`--bridge` / `--memory` / `--cores`（模板 VM 硬件，原先固定为 vmbr0 / 512 / 1）、
   `--dry-run`（只打印模板与 VMID 分配计划）、`--tui`。`--only-new` 会列出被跳过的模板，全部已存在时直接结束。
+- **`update-templates.py` 接入向导并完善**：`tui.py` 入口菜单新增「更新已导入模板」（`python3 tui.py update` /
+  `update-templates.py --tui` / `bash run.sh update`）：勾选目标（含已停止的普通 VM）→ 动作 → 软件源镜像 → 高级选项 → 确认。
+  新增 `--mirror <name>`（复用 `import.py` 的换源逻辑）；virt-customize 失败按 stderr 区分「appliance 起不来」与
+  「该模板脚本出错」：前者才回退 TCG / 中止全部，后者只记失败并继续；结束列出失败目标并以非 0 退出；Ctrl-C 友好退出。
 - **`import.py` 失败隔离与汇总**：单个模板下载失败 / `qm` 出错（或 Ctrl-C）时自动 `qm destroy` 清理半成品 VM，
   继续导入其余模板，结束时打印成功 / 跳过 / 失败汇总并以非 0 退出。
 - **镜像缓存目录固定为脚本目录下的 `cloud_img/`**（原先取决于当前工作目录，换目录运行会重复下载），
   可用 `CLOUD_IMG_DIR` 环境变量改到更大的分区。
+- **`run.sh` 支持 `update` 子命令**：`bash run.sh update` 打开更新向导，`-y update ...` 直接透传给 `update-templates.py`。
 - **`run.sh` 重写**：管道模式先克隆/更新仓库再以仓库内脚本继续（保证使用最新 `run.sh`）；仓库内运行时
   自动 `git pull --ff-only`（有本地修改时跳过，`NO_UPDATE=1` 关闭），`run.sh` 自身更新后重新执行；
   依赖齐全时跳过 `setup.sh`（`FORCE_SETUP=1` 强制）；非 root 自动 `sudo`；有终端时进入向导，
