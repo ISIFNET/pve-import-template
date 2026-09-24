@@ -10,6 +10,17 @@
 #   也可在命令行用 --no-tuning 全局关闭。
 # - 磁盘默认启用 discard 以回收精简置备存储空间，但不设置 ssd=1，不向访客伪装 SSD。
 # - customize 支持的键：uploads（--upload）、run（--run 脚本文件）、commands（--run-command 内联命令）。
+# - 模板「系列」由名称前缀自动推断（ubuntu-24.04 → ubuntu、almaLinux-9 → alma、centos-stream-9 → centos），
+#   也可在模板下显式写 family: xxx。
+
+# 默认导入的主流系列：
+#   * python3 import.py <storage> <vmid> 不指定模板时只导入这些系列（--all 导入全部）；
+#   * run.sh / tui.py 交互向导默认勾选这些系列，其余系列作为可选。
+default_families:
+  - ubuntu
+  - debian
+  - centos
+  - alpine
 
 # 镜像源配置 - 用于内网环境
 # 使用方法：python3 import.py local-lvm 900 --mirror aliyun

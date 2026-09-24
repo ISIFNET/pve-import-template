@@ -14,13 +14,19 @@ import.py - Proxmox VE Cloud Image Importer
 - 所有外部命令失败会抛出异常（更快发现问题）
 - 支持自定义镜像源：--mirror <mirror-name> 可为内网环境配置软件源
 - TLS 证书校验失败时不再无谓重试，直接给出排障提示；--insecure 可临时跳过校验
+- 默认只导入「主流系列」（templates.yaml 的 default_families，默认 ubuntu/debian/centos/alpine）；
+  --all 导入全部；模板选择器也支持直接写系列名（如 rocky、alpine）
+- --bridge / --memory / --cores 自定义模板 VM 默认硬件；--dry-run 仅打印导入计划
 
 用法
-  python3 import.py <storage-name> <start-vmid> [template-name[,name2|glob]] [--only-new] [--refresh] [--mirror <mirror-name>]
+  python3 import.py <storage-name> <start-vmid> [template-name[,name2|glob|family]] [options]
 
 示例
-  # 全部导入（从 900 开始编号）
+  # 导入主流系列（从 900 开始编号）
   python3 import.py local-lvm 900
+
+  # 导入 templates.yaml 中的全部模板
+  python3 import.py local-lvm 900 --all
 
   # 只导入 PVE 里还不存在的模板
   python3 import.py local-lvm 900 --only-new
@@ -28,8 +34,9 @@ import.py - Proxmox VE Cloud Image Importer
   # 只导入指定两个模板
   python3 import.py local-lvm 900 ubuntu-22.04,ubuntu-20.04
 
-  # 使用通配导入一批
+  # 使用通配 / 系列名导入一批
   python3 import.py local-lvm 900 'ubuntu-*'
+  python3 import.py local-lvm 900 rocky,alpine
 
   # 强制刷新镜像（无视缓存，重新下载）
   python3 import.py local-lvm 900 ubuntu-22.04 --refresh
@@ -51,6 +58,7 @@ import urllib.request
 import subprocess
 import json
 import fnmatch
+import re
 import tempfile
 from typing import Iterable, Tuple, Optional
 
@@ -67,8 +75,52 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 网络/内核 sysctl 调优脚本（import 与 update-templates.py 共用，单一数据源）
 TUNING_SCRIPT = os.path.join(SCRIPT_DIR, 'uploads', 'apply-net-tuning.sh')
+# 镜像缓存目录：默认在脚本目录下的 cloud_img（不随当前工作目录变化），可用 CLOUD_IMG_DIR 指到更大的分区
+CACHE_DIR = os.environ.get('CLOUD_IMG_DIR') or os.path.join(SCRIPT_DIR, 'cloud_img')
 DOWNLOAD_RETRIES = 3
 RETRIABLE_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
+
+# 未在 templates.yaml 里声明 default_families 时的默认主流系列
+DEFAULT_FAMILIES = ['ubuntu', 'debian', 'centos', 'alpine']
+
+# 系列显示名（--list / TUI 用）
+FAMILY_LABELS = {
+    'ubuntu': 'Ubuntu',
+    'debian': 'Debian',
+    'centos': 'CentOS Stream',
+    'rocky': 'Rocky Linux',
+    'alma': 'AlmaLinux',
+    'fedora': 'Fedora',
+    'opensuse': 'openSUSE Leap',
+    'arch': 'Arch Linux',
+    'alpine': 'Alpine Linux',
+}
+
+# 模板 VM 默认硬件（可用 --bridge / --memory / --cores 覆盖）
+VM_DEFAULTS = {'bridge': 'vmbr0', 'memory': 512, 'cores': 1}
+
+
+def template_family(template: dict) -> str:
+    """模板所属系列：优先取 family 键，否则由名称前缀推断（almaLinux-9 → alma）。"""
+    fam = template.get('family')
+    if fam:
+        return str(fam).lower()
+    match = re.match(r'[A-Za-z]+', template.get('name', ''))
+    fam = match.group(0).lower() if match else 'other'
+    if fam.endswith('linux') and fam != 'linux':
+        fam = fam[:-len('linux')]
+    return fam or 'other'
+
+
+def default_families(config: dict) -> list:
+    fams = config.get('default_families')
+    if not fams:
+        return list(DEFAULT_FAMILIES)
+    return [str(f).lower() for f in fams]
+
+
+def family_label(family: str) -> str:
+    return FAMILY_LABELS.get(family, family.capitalize())
 
 
 class DownloadError(RuntimeError):
@@ -510,10 +562,10 @@ def download_with_cache(name: str, url: str, unpack_cmd: Optional[str] = None, r
     - refresh: True 时忽略缓存、强制重下
     返回：img 路径
     """
-    os.makedirs('./cloud_img', exist_ok=True)
-    img = f'./cloud_img/{name}.img'
-    dl  = f'./cloud_img/{name}.img.download'
-    meta = f'./cloud_img/{name}.meta.json'
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    img = os.path.join(CACHE_DIR, f'{name}.img')
+    dl  = os.path.join(CACHE_DIR, f'{name}.img.download')
+    meta = os.path.join(CACHE_DIR, f'{name}.meta.json')
 
     if not refresh and os.path.exists(img):
         # 试图用 HEAD 比对
@@ -559,17 +611,32 @@ def download_with_cache(name: str, url: str, unpack_cmd: Optional[str] = None, r
     return img
 
 
-def match_templates(all_tpls: list, filter_expr: Optional[str]) -> list:
-    """支持逗号分隔/通配的模板选择"""
+def match_templates(all_tpls: list, filter_expr: Optional[str], families: Optional[list] = None) -> list:
+    """支持逗号分隔 / 通配 / 系列名的模板选择。
+
+    - filter_expr 为空时：families 为 None 返回全部，否则只返回属于这些系列的模板。
+    - 每个选择项依次尝试：精确名称 → glob 通配 → 系列名（如 rocky / alpine）。
+    """
     if not filter_expr:
-        return all_tpls
+        if families is None:
+            return list(all_tpls)
+        fams = {f.lower() for f in families}
+        return [t for t in all_tpls if template_family(t) in fams]
     names = [s.strip() for s in filter_expr.split(",") if s.strip()]
     matched = []
     for n in names:
         if any(ch in n for ch in "*?[]"):
             matched.extend([t for t in all_tpls if fnmatch.fnmatch(t["name"], n)])
+            continue
+        exact = [t for t in all_tpls if t["name"] == n]
+        if exact:
+            matched.extend(exact)
+            continue
+        by_family = [t for t in all_tpls if template_family(t) == n.lower()]
+        if by_family:
+            matched.extend(by_family)
         else:
-            matched.extend([t for t in all_tpls if t["name"] == n])
+            print(f'Warning: no template matches "{n}".')
     # 去重保持顺序
     seen = set()
     uniq = []
@@ -580,13 +647,26 @@ def match_templates(all_tpls: list, filter_expr: Optional[str]) -> list:
     return uniq
 
 
-def import_template(template: dict, storage: StorageInfo.Base, vmid: int, keep_image: bool = True, refresh: bool = False, mirror_config: Optional[dict] = None, apply_tuning: bool = True):
+def destroy_vm_quietly(vmid: int):
+    """导入中途失败时清理半成品 VM（尽力而为，不抛异常）。"""
+    print(f'清理未完成的 VM {vmid} ...')
+    subprocess.run(['qm', 'destroy', str(vmid), '--purge', '--destroy-unreferenced-disks', '1'],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def import_template(template: dict, storage: StorageInfo.Base, vmid: int, keep_image: bool = True,
+                    refresh: bool = False, mirror_config: Optional[dict] = None, apply_tuning: bool = True,
+                    vm_opts: Optional[dict] = None) -> str:
+    """导入单个模板；返回 'ok' 或 'skipped'，失败抛异常（半成品 VM 会被清理）。"""
     name = template['name']
     url  = template['url']
+    opts = dict(VM_DEFAULTS)
+    if vm_opts:
+        opts.update(vm_opts)
 
     if vm_exists_by_name(name):
         print(f'VM with name "{name}" exists, skipping.')
-        return
+        return 'skipped'
 
     print(f'Importing VMID {vmid} ({name}) from {url}')
 
@@ -611,23 +691,34 @@ def import_template(template: dict, storage: StorageInfo.Base, vmid: int, keep_i
             run(['virt-customize', '-a', img, *all_cust_args],
                 LIBGUESTFS_BACKEND='direct', LIBGUESTFS_BACKEND_SETTINGS='force_tcg')
 
-    # 创建 VM 并导入磁盘
-    run(f'qm create {vmid} --name {name} --memory 512 --net0 virtio,bridge=vmbr0,queues=4 --cpu host,flags=+aes --ostype l26 --agent enabled=1,fstrim_cloned_disks=1')
-    run(f'qm importdisk {vmid} {img} {storage.name} --format qcow2')
+    # 创建 VM 并导入磁盘；任一步失败（含 Ctrl-C）都清理掉半成品 VM，避免留下无盘/无模板标记的残留
+    created = False
+    try:
+        run(['qm', 'create', str(vmid), '--name', name,
+             '--memory', str(opts['memory']), '--cores', str(opts['cores']),
+             '--net0', f'virtio,bridge={opts["bridge"]},queues=4',
+             '--cpu', 'host,flags=+aes', '--ostype', 'l26',
+             '--agent', 'enabled=1,fstrim_cloned_disks=1'])
+        created = True
+        run(f'qm importdisk {vmid} {img} {storage.name} --format qcow2')
 
-    disk = storage.format_disk_name(vmid)
-    run(f'qm set {vmid} --scsihw virtio-scsi-single --scsi0 {storage.name}:{disk},discard=on')
-    run(f'qm set {vmid} --boot c --bootdisk scsi0')
-    run(f'qm set {vmid} --serial0 socket')
+        disk = storage.format_disk_name(vmid)
+        run(f'qm set {vmid} --scsihw virtio-scsi-single --scsi0 {storage.name}:{disk},discard=on')
+        run(f'qm set {vmid} --boot c --bootdisk scsi0')
+        run(f'qm set {vmid} --serial0 socket')
 
-    if template.get('cloud_init'):
-        run(f'qm set {vmid} --ide2 {storage.name}:cloudinit')
-        # 如需默认 root 用户，可在模板里 cloud-init 配置上传 ssh.cfg
-        run(f'qm set {vmid} --ciuser root')
-        # 默认用 DHCP 获取 IPv4，避免克隆后无网络（可在克隆后再覆盖）
-        run(f'qm set {vmid} --ipconfig0 ip=dhcp')
+        if template.get('cloud_init'):
+            run(f'qm set {vmid} --ide2 {storage.name}:cloudinit')
+            # 如需默认 root 用户，可在模板里 cloud-init 配置上传 ssh.cfg
+            run(f'qm set {vmid} --ciuser root')
+            # 默认用 DHCP 获取 IPv4，避免克隆后无网络（可在克隆后再覆盖）
+            run(f'qm set {vmid} --ipconfig0 ip=dhcp')
 
-    run(f'qm template {vmid}')
+        run(f'qm template {vmid}')
+    except BaseException:
+        if created:
+            destroy_vm_quietly(vmid)
+        raise
 
     if not keep_image:
         print(f'Deleting {img}')
@@ -635,23 +726,49 @@ def import_template(template: dict, storage: StorageInfo.Base, vmid: int, keep_i
             os.remove(img)
 
     print('Done\n')
+    return 'ok'
 
 
-USAGE = '''Usage: python3 import.py <storage-name> <start-vmid> [template-name[,name2|glob]] [options]
+def print_summary(results: dict):
+    total = sum(len(v) for v in results.values())
+    print(f'\n===== 导入汇总：{total} 个模板 =====')
+    if results['ok']:
+        print(f'  成功 {len(results["ok"])}：' + ', '.join(f'{n}({v})' for n, v in results['ok']))
+    if results['skipped']:
+        print(f'  跳过 {len(results["skipped"])}：' + ', '.join(n for n, _ in results['skipped']))
+    if results['failed']:
+        print(f'  失败 {len(results["failed"])}：')
+        for name, reason in results['failed']:
+            print(f'    - {name}: {reason}')
+        print('  失败的模板可修复原因后用 --only-new 重新运行，已成功的会自动跳过。')
+
+
+USAGE = '''Usage: python3 import.py <storage-name> <start-vmid> [template-name[,name2|glob|family]] [options]
+
+不指定模板时，默认只导入「主流系列」（templates.yaml 中 default_families，
+默认为 ubuntu/debian/centos/alpine）；--all 导入全部。选择器可写模板名、glob 通配或系列名。
 
 Options:
+  --all               导入 templates.yaml 中的全部模板（忽略 default_families）
   --only-new          只导入 PVE 中尚不存在的模板
   --refresh           忽略缓存，强制重新下载镜像
   --mirror <name>     使用 templates.yaml 中配置的镜像源（内网环境）
   --no-tuning         本次导入不注入网络/内核 sysctl 调优（默认开启）
   --insecure          下载镜像时跳过 TLS 证书校验（仅用于临时绕过证书问题）
+  --bridge <name>     模板网卡所接网桥（默认 vmbr0）
+  --memory <MB>       模板内存大小（默认 512）
+  --cores <n>         模板 CPU 核数（默认 1）
+  --dry-run           只打印导入计划（模板与分配的 VMID），不下载不创建
   --list              列出 templates.yaml 中所有可用模板后退出
+  --tui               启动交互式向导（等价于 python3 tui.py）
   -h, --help          显示本帮助
 
 Examples:
   python3 import.py local-lvm 900
+  python3 import.py local-lvm 900 --all
   python3 import.py local-lvm 900 --only-new
-  python3 import.py local-lvm 900 'ubuntu-*' --mirror tsinghua
+  python3 import.py local-lvm 900 'ubuntu-*',rocky --mirror tsinghua
+  python3 import.py local-lvm 900 --bridge vmbr1 --memory 1024 --cores 2
   python3 import.py --list'''
 
 
@@ -664,19 +781,27 @@ def load_config() -> dict:
 def print_template_list():
     config = load_config()
     _, existing = cluster_vm_index()
-    print('可用模板（templates.yaml）：')
+    defaults = default_families(config)
+    groups = {}
     for t in config.get('templates', []):
-        name = t['name']
-        flags = []
-        if name in existing:
-            flags.append('已存在')
-        if t.get('net_tuning', True) is False:
-            flags.append('调优:关')
-        suffix = f'  [{", ".join(flags)}]' if flags else ''
-        print(f'  - {name}{suffix}')
+        groups.setdefault(template_family(t), []).append(t)
+    print('可用模板（templates.yaml）：  * = 默认导入的主流系列')
+    for fam, tpls in groups.items():
+        mark = '*' if fam in defaults else ' '
+        print(f'\n{mark} {family_label(fam)} ({fam})')
+        for t in tpls:
+            name = t['name']
+            flags = []
+            if name in existing:
+                flags.append('已存在')
+            if t.get('net_tuning', True) is False:
+                flags.append('调优:关')
+            suffix = f'  [{", ".join(flags)}]' if flags else ''
+            print(f'    - {name}{suffix}')
+    print(f'\n默认系列：{", ".join(defaults)}（--all 导入全部；选择器可直接写系列名）')
     mirrors = config.get('mirrors', {})
     if mirrors:
-        print(f'\n可用镜像源：{", ".join(mirrors.keys())}')
+        print(f'可用镜像源：{", ".join(mirrors.keys())}')
 
 
 def main():
@@ -687,6 +812,10 @@ def main():
     if '--list' in sys.argv[1:]:
         print_template_list()
         return
+    if '--tui' in sys.argv[1:]:
+        tui = os.path.join(SCRIPT_DIR, 'tui.py')
+        rest = [a for a in sys.argv[1:] if a != '--tui']
+        os.execv(sys.executable, [sys.executable, tui, *rest])
 
     # 依赖检查（只验证存在，不强制版本）
     try:
@@ -715,9 +844,21 @@ def main():
     refresh = False
     apply_tuning = True
     insecure = False
+    import_all = False
+    dry_run = False
     mirror_name = None
+    vm_opts = {}
     args = sys.argv[3:]
     i = 0
+
+    def take_value(opt: str) -> str:
+        nonlocal i
+        if i + 1 >= len(args):
+            print(f'Error: {opt} requires a value.')
+            sys.exit(1)
+        i += 1
+        return args[i]
+
     while i < len(args):
         arg = args[i]
         if arg == '--only-new':
@@ -728,13 +869,20 @@ def main():
             apply_tuning = False
         elif arg == '--insecure':
             insecure = True
+        elif arg == '--all':
+            import_all = True
+        elif arg == '--dry-run':
+            dry_run = True
         elif arg == '--mirror':
-            if i + 1 < len(args):
-                mirror_name = args[i + 1]
-                i += 1
-            else:
-                print('Error: --mirror requires a mirror name.')
+            mirror_name = take_value(arg)
+        elif arg == '--bridge':
+            vm_opts['bridge'] = take_value(arg)
+        elif arg in ('--memory', '--cores'):
+            value = take_value(arg)
+            if not value.isdigit() or int(value) <= 0:
+                print(f'Error: {arg} must be a positive integer.')
                 sys.exit(1)
+            vm_opts[arg[2:]] = int(value)
         elif not arg.startswith('-'):
             template_filter = arg
         else:
@@ -762,7 +910,10 @@ def main():
         mirror_config = mirrors[mirror_name]
         print(f'Using mirror: {mirror_name}')
 
-    to_import_all = match_templates(all_tpls, template_filter)
+    families = None if (import_all or template_filter) else default_families(config)
+    if families is not None:
+        print(f'未指定模板：默认只导入主流系列 {", ".join(families)}（--all 导入全部）。')
+    to_import_all = match_templates(all_tpls, template_filter, families)
     if not to_import_all:
         print('No templates matched. Use --list to see available templates.')
         return
@@ -770,24 +921,68 @@ def main():
     # 跨集群收集已用 VMID / 名称：--only-new 跨节点判断，VMID 分配自动跳过已占用（集群内 VMID 全局唯一）
     used_vmids, existing_names = cluster_vm_index()
     if only_new:
+        skipped = [t['name'] for t in to_import_all if t['name'] in existing_names]
+        if skipped:
+            print(f'--only-new：跳过已存在的模板 {", ".join(skipped)}')
         to_import_all = [t for t in to_import_all if t['name'] not in existing_names]
+        if not to_import_all:
+            print('所有匹配的模板都已存在，无需导入。')
+            return
 
+    if dry_run:
+        print('\n导入计划（--dry-run，不会下载或创建）：')
+        planned = start_vmid
+        for tpl in to_import_all:
+            while planned in used_vmids:
+                planned += 1
+            note = '  (已存在，将跳过)' if tpl['name'] in existing_names else ''
+            print(f'  {planned:>6}  {tpl["name"]}{note}')
+            used_vmids.add(planned)
+            planned += 1
+        opts = dict(VM_DEFAULTS)
+        opts.update(vm_opts)
+        print(f'\nstorage={storage.name} bridge={opts["bridge"]} memory={opts["memory"]} cores={opts["cores"]} '
+              f'tuning={"on" if apply_tuning else "off"} mirror={mirror_name or "-"}')
+        return
+
+    print(f'镜像缓存目录：{CACHE_DIR}')
     vmid = start_vmid
+    results = {'ok': [], 'skipped': [], 'failed': []}
     for tpl in to_import_all:
         while vmid in used_vmids:
             print(f'VMID {vmid} 已被占用（集群内），跳过。')
             vmid += 1
-        import_template(
-            tpl,
-            storage,
-            vmid,
-            keep_image=not refresh,
-            refresh=refresh,
-            mirror_config=mirror_config,
-            apply_tuning=apply_tuning
-        )
+        try:
+            status = import_template(
+                tpl,
+                storage,
+                vmid,
+                keep_image=not refresh,
+                refresh=refresh,
+                mirror_config=mirror_config,
+                apply_tuning=apply_tuning,
+                vm_opts=vm_opts
+            )
+        except DownloadError as exc:
+            print(f'\nError: {exc}\n', file=sys.stderr)
+            results['failed'].append((tpl['name'], str(exc).splitlines()[0]))
+            continue
+        except subprocess.CalledProcessError as exc:
+            cmd = exc.cmd if isinstance(exc.cmd, str) else ' '.join(map(str, exc.cmd))
+            reason = f'命令失败（退出码 {exc.returncode}）：{cmd[:120]}'
+            print(f'\nError: 导入 {tpl["name"]} 失败：{reason}\n', file=sys.stderr)
+            results['failed'].append((tpl['name'], reason))
+            continue
+        if status == 'skipped':
+            results['skipped'].append((tpl['name'], vmid))
+            continue
+        results['ok'].append((tpl['name'], vmid))
         used_vmids.add(vmid)
         vmid += 1
+
+    print_summary(results)
+    if results['failed']:
+        sys.exit(1)
 
 
 if __name__ == '__main__':
@@ -796,3 +991,6 @@ if __name__ == '__main__':
     except DownloadError as exc:
         print(f'\nError: {exc}', file=sys.stderr)
         sys.exit(1)
+    except KeyboardInterrupt:
+        print('\n已中断。', file=sys.stderr)
+        sys.exit(130)

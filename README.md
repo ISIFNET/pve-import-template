@@ -2,9 +2,10 @@
 
 自动化导入 Cloud-init 镜像到 Proxmox VE 的工具。支持 Ubuntu、Debian、CentOS Stream、Rocky Linux、AlmaLinux、Fedora、openSUSE、Arch Linux、Alpine Linux 等主流发行版。
 
-包含两个工具：
+包含三个工具：
 
-- **`import.py`** —— 下载云镜像、离线定制、创建并转换为 PVE 模板。
+- **`tui.py`** —— 交互式导入向导（`run.sh` 默认入口）：选存储、起始 VMID、系统模板与各项选项，最后调用 `import.py`。
+- **`import.py`** —— 下载云镜像、离线定制、创建并转换为 PVE 模板。默认只导入主流系列（Ubuntu / Debian / CentOS Stream / Alpine），其余系列按需选择。
 - **`update-templates.py`** —— 对**已经导入**的模板就地重新应用定制（网络调优 / qemu-guest-agent / 允许 root 登录等），**无需重新下载或重建模板**。
 
 > 变更历史见 [CHANGELOG.md](./CHANGELOG.md)。
@@ -14,10 +15,34 @@
 ### 一键安装（推荐）
 
 ```bash
-wget -O - https://raw.githubusercontent.com/ISIFNET/pve-import-template/refs/heads/master/run.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ISIFNET/pve-import-template/refs/heads/master/run.sh | bash
 # 或
-curl https://raw.githubusercontent.com/ISIFNET/pve-import-template/refs/heads/master/run.sh | bash
+wget -O - https://raw.githubusercontent.com/ISIFNET/pve-import-template/refs/heads/master/run.sh | bash
 ```
+
+`run.sh` 会克隆/更新仓库、按需运行 `setup.sh`，然后打开**交互式向导**（`tui.py`）：
+
+1. 选择存储（自动列出支持 `images` 的存储及剩余空间）
+2. 起始 VMID（已占用会提示并自动跳过）
+3. 选择系统模板：预设「主流系列（Ubuntu / Debian / CentOS Stream / Alpine）」「全部」「按系列选择」「逐个勾选」，
+   之后仍可逐个勾选微调；已存在的模板自动标记
+4. 导入选项：跳过已存在、网络/内核调优、强制重下、跳过 TLS 校验
+5. 软件源镜像：`templates.yaml` 里的 `aliyun / tsinghua / huawei / tencent / ustc` 或内网源
+6. 模板硬件：网桥（自动检测）、内存、CPU 核数
+
+确认页会显示**等价的 `import.py` 命令**，方便复制到脚本里；上一次的选择会记住（`~/.config/pve-import-template/last.json`）。
+有 `whiptail`/`dialog` 时使用对话框界面，否则回退为纯文本菜单（`--text` 可强制）。
+
+```bash
+bash run.sh                         # 交互向导
+bash run.sh local-lvm 9000          # 向导，预填存储 / 起始 VMID
+bash run.sh -y                      # 非交互：主流系列 + --only-new，storage=local-lvm，vmid 从 9000 开始
+bash run.sh -y tank 9000 --all      # 非交互：导入全部模板
+bash run.sh --setup-only            # 只准备环境
+curl -fsSL .../run.sh | bash -s -- -y local-lvm 9000
+```
+
+环境变量：`INSTALL_DIR`（管道模式的克隆目录）、`NO_UPDATE=1`（不 `git pull`）、`SKIP_SETUP=1` / `FORCE_SETUP=1`、`NONINTERACTIVE=1`。
 
 ### 手动安装
 
@@ -25,59 +50,99 @@ curl https://raw.githubusercontent.com/ISIFNET/pve-import-template/refs/heads/ma
 apt install -y git
 git clone https://github.com/ISIFNET/pve-import-template
 cd pve-import-template
-./setup.sh          # 添加 no-subscription 源、安装依赖并检查 TLS/时间同步
+./setup.sh          # 修复 apt 源、安装依赖、配置嵌套虚拟化并检查环境
+python3 tui.py      # 或直接 python3 import.py <storage> <start-vmid> ...
 ```
 
-`setup.sh` 同时支持 PVE 8（bookworm）与 PVE 9（trixie）：
+`setup.sh` 支持 PVE 7（bullseye）/ 8（bookworm）/ 9（trixie），幂等可重复运行：
 
-- 使用 deb822 格式写入 `/etc/apt/sources.list.d/pve-no-subscription.sources`（已存在则跳过）；
-- 未检测到有效订阅时自动禁用 `enterprise.proxmox.com` 源（否则 PVE 9 上 `apt update` 会因 401 失败）；
-- 安装 `git python3-tqdm python3-yaml libguestfs-tools unzip xz-utils ca-certificates`；
-- 检查 NTP 时间同步与到 `cloud.debian.org` 的 HTTPS 链路，失败时给出排障提示。
-- 环境变量：`SKIP_REPO=1` 不修改 apt 源；`SKIP_CHECKS=1` 跳过检查；`TLS_CHECK_URL` 自定义检查地址。
+- 从 `/etc/os-release` / `/etc/debian_version` 识别版本，不依赖 `lsb_release`；
+- 未检测到有效订阅时自动禁用 `enterprise.proxmox.com`（pve / ceph）源，否则 `apt update` 会因 401 失败；
+  注释掉失效的 `cdrom:` 源；缺少 Proxmox 仓库密钥时自动下载；
+- 添加 `pve-no-subscription` 源（bookworm/trixie 用 deb822 `.sources`，bullseye 用 `.list`；已存在则跳过）；
+- 只安装缺失的依赖：`git python3-tqdm python3-yaml libguestfs-tools unzip xz-utils ca-certificates whiptail curl`
+  （可选 `libguestfs-xfs`；非 PVE 主机额外 `qemu-utils`），`apt update` 失败时给出 401 / NO_PUBKEY / DNS 诊断；
+- 按 CPU 厂商启用嵌套虚拟化（`kvm_intel` / `kvm_amd` 的 `nested=1`）；
+- 检查 NTP 时间同步（未同步时尝试 `chronyc makestep`）、HTTPS 下载链路、`/dev/kvm` 与 libguestfs 前置条件、磁盘剩余空间，
+  最后汇总需要留意的项。
+- 选项 / 环境变量：`--skip-repo`(`SKIP_REPO=1`)、`--skip-checks`(`SKIP_CHECKS=1`)、`--no-nested`(`SKIP_NESTED=1`)、
+  `--full-check`(`FULL_CHECK=1`，运行 `libguestfs-test-tool`)、`TLS_CHECK_URL`。
+
+## tui.py —— 交互式向导
+
+```bash
+python3 tui.py [storage] [start-vmid] [template-selector] [import.py 的选项...] [--text] [--dry-run] [--no-save]
+```
+
+所有参数只作为向导的**默认值**（例如 `python3 tui.py tank 9000 --mirror aliyun`），最终以向导里的选择为准。
+
+| 选项 | 说明 |
+|------|------|
+| `--text` | 强制纯文本菜单（不用 whiptail/dialog；也允许从管道喂入答案，便于脚本化） |
+| `--dry-run` | 确认后只打印导入计划（透传给 `import.py --dry-run`） |
+| `--no-save` | 不把本次选择写入 `~/.config/pve-import-template/last.json` |
+| `-h` | 显示帮助 |
+
+向导内：`Esc`/「返回」回到上一步；确认页可回到任一步修改，或「仅打印等价命令并退出」把命令拿去脚本里用。
 
 ## import.py —— 导入模板
 
 ### 基本语法
 
 ```bash
-python3 import.py <storage-name> <start-vmid> [template-name] [选项]
+python3 import.py <storage-name> <start-vmid> [template-selector] [选项]
 ```
 
 - `<storage-name>`：PVE 存储名称（如 `local-lvm`、`local`、`zfs-pool`）
 - `<start-vmid>`：起始 VM ID，例如 900
-- `[template-name]`：可选，指定模板（支持逗号分隔或通配符）
+- `[template-selector]`：可选，逗号分隔的模板名 / 通配符 / **系列名**（如 `rocky`、`alpine`）。
+  不指定时只导入 `templates.yaml` 中 `default_families` 定义的主流系列（默认 `ubuntu debian centos alpine`），`--all` 导入全部。
 
 ### 选项
 
 | 选项 | 说明 |
 |------|------|
+| `--all` | 导入 `templates.yaml` 中的全部模板（忽略 `default_families`） |
 | `--only-new` | 只导入 PVE 中尚不存在的模板 |
 | `--refresh` | 忽略缓存，强制重新下载镜像 |
 | `--mirror <name>` | 使用 `templates.yaml` 中配置的镜像源（内网环境） |
 | `--no-tuning` | 本次导入不注入网络/内核 sysctl 调优（默认开启） |
 | `--insecure` | 下载镜像时跳过 TLS 证书校验（仅用于临时绕过证书问题） |
-| `--list` | 列出所有可用模板与镜像源后退出 |
+| `--bridge <name>` / `--memory <MB>` / `--cores <n>` | 模板 VM 的网桥 / 内存 / 核数（默认 `vmbr0` / 512 / 1） |
+| `--dry-run` | 只打印导入计划（模板与分配的 VMID），不下载不创建 |
+| `--list` | 按系列列出所有可用模板与镜像源后退出 |
+| `--tui` | 启动交互式向导（等价于 `python3 tui.py`） |
 | `-h, --help` | 显示帮助 |
 
 ### 使用示例
 
 ```bash
-python3 import.py --list                                   # 查看可用模板
-python3 import.py local-lvm 900                            # 导入全部（从 900 开始）
+python3 import.py --list                                   # 按系列查看可用模板
+python3 import.py local-lvm 900                            # 导入主流系列（从 900 开始）
+python3 import.py local-lvm 900 --all                      # 导入全部
 python3 import.py local-lvm 900 --only-new                 # 只导入还不存在的
 python3 import.py local-lvm 900 ubuntu-22.04,ubuntu-20.04  # 指定多个
+python3 import.py local-lvm 900 rocky,alma                 # 按系列
 python3 import.py local-lvm 900 'ubuntu-*' --mirror tsinghua
 python3 import.py local-lvm 900 ubuntu-22.04 --refresh
 python3 import.py local-lvm 900 'rocky-*' --no-tuning
+python3 import.py tank 900 --bridge vmbr1 --memory 1024 --cores 2 --dry-run
 ```
+
+### 运行行为
+
+- **镜像缓存**：下载的镜像保存在脚本目录下的 `cloud_img/`（不随当前工作目录变化），可用环境变量 `CLOUD_IMG_DIR` 指到更大的分区；
+  再次导入时用 ETag / Last-Modified 比对，未变化则不重新下载，`--refresh` 强制重下并在导入后删除缓存。
+- **逐个隔离失败**：某个模板下载失败或 `qm` 命令出错时，会清理该 VMID 的半成品 VM，继续导入其余模板，
+  结束时打印「成功 / 跳过 / 失败」汇总并以非 0 退出；修复原因后加 `--only-new` 重跑即可，已成功的自动跳过。
+- **`Ctrl-C`** 中断时同样会清理当前未完成的 VM。
 
 ### 导入时的 VM 默认配置
 
-- `--cpu host,flags=+aes`、`--ostype l26`
+- `--cpu host,flags=+aes`、`--ostype l26`、`--memory 512`、`--cores 1`（可用 `--memory` / `--cores` 覆盖）
 - `--agent enabled=1,fstrim_cloned_disks=1`（启用 QEMU Guest Agent，克隆后自动 fstrim）
 - 系统盘 `virtio-scsi-single` + `discard=on`（支持 TRIM/精简回收，不伪装为 SSD）
-- `--net0 virtio,bridge=vmbr0,queues=4`、`--serial0 socket`
+- `--net0 virtio,bridge=vmbr0,queues=4`（网桥可用 `--bridge` 覆盖）、`--serial0 socket`
 - 启用 cloud-init 时：挂载 cloudinit 盘、`--ciuser root`、`--ipconfig0 ip=dhcp`
 
 > **集群**：`--only-new` 跨节点判断模板是否已存在；分配 VMID 时自动跳过集群内已占用的 ID
@@ -131,16 +196,18 @@ python3 update-templates.py 9000 9001 -y
 
 | 系列 | 模板 |
 |------|------|
-| Ubuntu | ubuntu-18.04 / 20.04 / 22.04 / 24.04 / **26.04** |
-| Debian | debian-10 / 11 / 12 / 13 |
-| CentOS Stream | centos-stream-9 / 10（stream-8 已 EOL，默认注释） |
-| Rocky Linux | **rocky-8 / 9 / 10** |
+| Ubuntu（默认） | ubuntu-18.04 / 20.04 / 22.04 / 24.04 / **26.04** |
+| Debian（默认） | debian-10 / 11 / 12 / 13 |
+| CentOS Stream（默认） | centos-stream-9 / 10（stream-8 已 EOL，默认注释） |
+| Alpine Linux（默认） | alpineLinux-3.22 / 3.23 / 3.24 |
+| Rocky Linux | rocky-8 / 9 / 10 |
 | AlmaLinux | almaLinux-8 / 9 / 10 |
-| Fedora | **fedora-42 / 43** |
-| openSUSE | **opensuse-leap-15.6** |
-| 其他 | archLinux、alpineLinux-3.22 / 3.23 |
+| Fedora | fedora-42 / 43 / 44 |
+| openSUSE | opensuse-leap-15.6 / 16.0 |
+| Arch Linux | archLinux |
 
-`python3 import.py --list` 可查看当前 `templates.yaml` 中的全部模板。
+标注「默认」的系列由 `templates.yaml` 的 `default_families` 决定：不指定模板时 `import.py` 只导入这些系列，向导默认勾选这些系列，
+其余系列在向导中按需勾选或用 `--all` / 系列名导入。`python3 import.py --list` 可按系列查看全部模板。
 
 ## 内置定制行为
 
@@ -223,9 +290,10 @@ mirrors:
 
 ## 自定义模板
 
-编辑 `templates.yaml`，每个模板支持：
+编辑 `templates.yaml`。顶层 `default_families` 列出默认导入的系列；每个模板支持：
 
-- `name`：模板名称
+- `name`：模板名称（系列由名称前缀自动推断：`ubuntu-24.04` → `ubuntu`、`almaLinux-9` → `alma`）
+- `family`：可选，显式指定系列名
 - `url`：镜像下载地址
 - `cloud_init`：是否启用 cloud-init
 - `net_tuning`：是否注入网络/内核调优（默认 `true`，设 `false` 关闭）

@@ -2,7 +2,46 @@
 
 本文件记录对 pve-import-template 的主要改动。
 
-## [Unreleased] - 2026-09-15
+## [Unreleased] - 2026-09-24
+
+### 交互式向导与默认只导入主流系列
+
+- **新增 `tui.py` 交互式导入向导**（`run.sh` 默认入口；也可 `python3 import.py --tui`）：
+  依次选择存储（自动列出支持 `images` 的存储与剩余空间）→ 起始 VMID（占用检测）→ 系统模板
+  （预设：主流系列 / 全部 / 按系列 / 逐个勾选，已存在的模板自动标记）→ 导入选项 → 软件源镜像 → 模板硬件
+  （网桥自动检测 / 内存 / 核数）→ 确认页（显示等价 `import.py` 命令，可回到任一步修改）。
+  有 `whiptail`/`dialog` 用对话框界面，否则回退纯文本菜单（`--text`）；上次选择保存在
+  `~/.config/pve-import-template/last.json`；`curl | bash` 管道模式下自动接管 `/dev/tty`。
+- **`import.py` 默认只导入主流系列**：`templates.yaml` 新增顶层 `default_families`
+  （默认 `ubuntu debian centos alpine`）；不指定模板时只导入这些系列，`--all` 导入全部。
+  模板选择器新增**系列名**匹配（`rocky,alpine`），`--list` 改为按系列分组显示并标出默认系列。
+- **`import.py` 新选项**：`--bridge` / `--memory` / `--cores`（模板 VM 硬件，原先固定为 vmbr0 / 512 / 1）、
+  `--dry-run`（只打印模板与 VMID 分配计划）、`--tui`。`--only-new` 会列出被跳过的模板，全部已存在时直接结束。
+- **`import.py` 失败隔离与汇总**：单个模板下载失败 / `qm` 出错（或 Ctrl-C）时自动 `qm destroy` 清理半成品 VM，
+  继续导入其余模板，结束时打印成功 / 跳过 / 失败汇总并以非 0 退出。
+- **镜像缓存目录固定为脚本目录下的 `cloud_img/`**（原先取决于当前工作目录，换目录运行会重复下载），
+  可用 `CLOUD_IMG_DIR` 环境变量改到更大的分区。
+- **`run.sh` 重写**：管道模式先克隆/更新仓库再以仓库内脚本继续（保证使用最新 `run.sh`）；仓库内运行时
+  自动 `git pull --ff-only`（有本地修改时跳过，`NO_UPDATE=1` 关闭），`run.sh` 自身更新后重新执行；
+  依赖齐全时跳过 `setup.sh`（`FORCE_SETUP=1` 强制）；非 root 自动 `sudo`；有终端时进入向导，
+  `-y` / 无终端时非交互导入（默认主流系列 + `--only-new`）；`--setup-only` 只准备环境；
+  非 UTF-8 locale 自动设置 `LC_ALL=C.UTF-8`。嵌套虚拟化配置移到 `setup.sh`。
+
+### setup.sh 兼容性与完整性
+
+- 支持 PVE 7（bullseye）/ 8（bookworm）/ 9（trixie）；`VERSION_CODENAME` 缺失时从 `/etc/debian_version` 推断；
+  非 root 自动 `sudo`；新增命令行选项 `--skip-repo` / `--skip-checks` / `--no-nested` / `--full-check` / `-h`。
+- apt 源：注释掉失效的 `cdrom:` 源；已存在的 `.list` 形式 no-subscription 源也能识别（不重复添加）；
+  Proxmox 仓库密钥缺失时自动从 `enterprise.proxmox.com` 下载；bullseye 写 `.list`，bookworm/trixie 写 deb822。
+- 依赖：只安装缺失的包（重复运行更快），新增 `whiptail`、`curl`，可选 `libguestfs-xfs`，非 PVE 主机补 `qemu-utils`；
+  `apt-get update` 失败时诊断 401 / NO_PUBKEY / DNS 并继续尝试安装，批量失败时逐个安装定位；
+  apt 装不上 yaml/tqdm 时回退 pip；最终校验 `virt-customize` / `xz` / `unzip` 可用。
+- 新增检查：`/dev/kvm` 是否存在（否则提示会回退 force_tcg）、`/boot/vmlinuz-*` 权限、缓存目录剩余空间（< 10 GiB 告警）、
+  PVE 命令齐全性；时间未同步时先尝试 `chronyc makestep`；TLS 检查显示使用的代理并区分 DNS 失败；
+  `--full-check` 运行 `libguestfs-test-tool`。结束时汇总所有告警。
+- 嵌套虚拟化：识别 Intel/AMD 且支持 vmx/svm 才配置；已启用则不重载模块；有 VM 运行时不重载并提示重启后生效。
+
+## [0.x] - 2026-09-15
 
 ### PVE 9 适配与安装脚本
 
