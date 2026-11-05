@@ -7,9 +7,10 @@ set -u
 ok=0
 
 fix_debian_eol_sources() {
-  # 切到 archive.debian.org，并关闭 Valid-Until 校验
+  # 切到 archive.debian.org，并关闭 Valid-Until 校验（只在源确实不可用时调用：在支持期内的版本
+  # 关掉 Valid-Until 等于关掉 apt 的防重放 / 防冻结保护，会被带进每一台克隆）
   mkdir -p /etc/apt/apt.conf.d || true
-  printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99ignore-valid-until || true
+  printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99pit-archive-valid-until || true
   for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
     [ -f "$f" ] || continue
     sed -i -E 's@https?://deb\.debian\.org/debian@http://archive.debian.org/debian@g' "$f" || true
@@ -44,13 +45,16 @@ if command -v apt-get >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   . /etc/os-release 2>/dev/null || true
   low_id="$(printf '%s' "${ID:-}" | tr '[:upper:]' '[:lower:]')"
-  case ",$low_id," in
-    *,debian,*) fix_debian_eol_sources ;;
-    *,ubuntu,*) fix_ubuntu_eol_sources ;;
-    *) : ;;
-  esac
-
-  apt-get -o Acquire::Check-Valid-Until=false update || true
+  # 先按镜像自带的源更新；只有失败（仓库已归档）才切 archive / old-releases。旧版对所有 Ubuntu 无条件
+  # 改到 old-releases，仍在支持期的 22.04 会因此 update 失败、qga 静默装不上
+  if ! apt-get update; then
+    case ",$low_id," in
+      *,debian,*) fix_debian_eol_sources ;;
+      *,ubuntu,*) fix_ubuntu_eol_sources ;;
+      *) : ;;
+    esac
+    apt-get -o Acquire::Check-Valid-Until=false update || true
+  fi
   if apt-get install -y --no-install-recommends qemu-guest-agent; then
     ok=1
   fi
