@@ -17,24 +17,24 @@
 #     checksum    校验文件地址，可用 {url} / {dir} 占位；支持 SHA256SUMS / SHA512SUMS / BSD 风格 / 单 hash 文件
 #     checksum_pattern  校验文件名随构建号变化时（Fedora），在镜像所在目录里按正则找
 #     cloud_init / net_tuning / upgrade（默认 true）/ unpack / customize{uploads,run,commands} / family
-#     eol: true   已停止维护（仅提示；不进 standard / minimal 配置组）
+#     eol         true = 已停止维护；或 'YYYY-MM-DD' = 到这天起算停止维护（按 endoflife.date 的安全支持截止日填，工具按日期自动判定，
+#                 不用到期再改 yaml）。EOL 的模板 sync 不补缺、不按年龄重建（上游变了仍会重建），也不该出现在 minimal / standard 组
 # - 磁盘默认启用 discard 以回收精简置备存储空间，但不设置 ssd=1，不向访客伪装 SSD。
 
-# 默认导入的主流系列：
-#   * python3 import.py <storage> <vmid> 不指定模板时只导入这些系列（--all 导入全部）；
-#   * run.sh / tui.py 交互向导默认勾选这些系列，其余系列作为可选。
-default_families:
-  - ubuntu
-  - debian
-  - centos
-  - alpine
+# 默认配置组：python3 import.py <storage> <vmid> 不指定模板时导入它，run.sh / tui.py 向导默认勾选它，
+# sync-templates.py 的 ADD_MISSING 在没写 PROFILE / SELECTOR 时也只补它（--all / @full 才是全部）。
+default_profile: standard
 
 # 配置组：小硬盘节点不需要全部模板。选择器里写 @minimal / @standard / @full，
 # 或在 /etc/pve-import-template.conf 写 PROFILE=minimal（sync-templates.py 只维护组内模板，ADD_MISSING=1 才补缺）。
+# 组里只放还在安全支持期内的版本（tests 钉死）；EOL 日期到了 sync 自动不再补，届时把它移出组、换上新版本。
+#   minimal  每个主流发行版一到两个 LTS（约 6 × 1–2 GiB，小硬盘 / 边缘节点）
+#   standard 在售发行版的全部受支持版本（平台下单页的常规选择）
 profiles:
-  minimal: [debian-13, debian-12, ubuntu-24.04, ubuntu-22.04, alpineLinux-3.23]
-  standard: [debian-13, debian-12, ubuntu-26.04, ubuntu-24.04, ubuntu-22.04, centos-stream-9, centos-stream-10,
-             almaLinux-9, almaLinux-10, rocky-9, rocky-10, alpineLinux-3.22, alpineLinux-3.23, alpineLinux-3.24]
+  minimal: [debian-13, debian-12, ubuntu-24.04, ubuntu-22.04, rocky-9, alpineLinux-3.23]
+  standard: [debian-13, debian-12, ubuntu-26.04, ubuntu-24.04, ubuntu-22.04,
+             rocky-10, rocky-9, rocky-8, almaLinux-10, almaLinux-9, almaLinux-8,
+             centos-stream-10, centos-stream-9, alpineLinux-3.24, alpineLinux-3.23]
   full: ['*']
 
 # 镜像下载的备用站：主站下载失败（超时 / 5xx / 404）时按前缀改写地址依次尝试。校验文件仍先从主站取，
@@ -150,6 +150,7 @@ templates:
         - ./uploads/install-qga.sh
 
   - name: ubuntu-22.04
+    eol: '2027-06-01'
     url: https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img
     checksum: '{dir}/SHA256SUMS'
     cloud_init: true
@@ -161,6 +162,7 @@ templates:
         - ./uploads/install-qga.sh
 
   - name: ubuntu-24.04
+    eol: '2029-05-31'
     url: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
     checksum: '{dir}/SHA256SUMS'
     cloud_init: true
@@ -172,6 +174,7 @@ templates:
         - ./uploads/install-qga.sh
 
   - name: ubuntu-26.04
+    eol: '2031-05-29'
     url: https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img
     checksum: '{dir}/SHA256SUMS'
     cloud_init: true
@@ -208,6 +211,7 @@ templates:
         - ./uploads/install-qga.sh
 
   - name: debian-12
+    eol: '2028-06-30'
     url: https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2
     checksum: '{dir}/SHA512SUMS'
     cloud_init: true
@@ -219,6 +223,7 @@ templates:
         - ./uploads/install-qga.sh
 
   - name: debian-13
+    eol: '2030-06-30'
     url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
     checksum: '{dir}/SHA512SUMS'
     cloud_init: true
@@ -233,6 +238,7 @@ templates:
   # 2026-11 上游把 10-stream 改名（GenericCloud-x86_64-10-latest → GenericCloud-10-latest，旧地址 502）：
   # 用 discover 挑最新的带日期构建，新旧两种命名都认；dated 文件名稳定、有逐文件 .SHA256SUM
   - name: centos-stream-9
+    eol: '2027-05-31'
     url: https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2
     discover:
       index: https://cloud.centos.org/centos/9-stream/x86_64/images/
@@ -247,6 +253,7 @@ templates:
         - ./uploads/install-qga.sh
 
   - name: centos-stream-10
+    eol: '2030-05-31'
     url: https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2
     discover:
       index: https://cloud.centos.org/centos/10-stream/x86_64/images/
@@ -265,6 +272,7 @@ templates:
 
   # ===== Rocky Linux =====
   - name: rocky-8
+    eol: '2029-05-31'
     url: https://dl.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-GenericCloud.latest.x86_64.qcow2
     checksum: '{url}.CHECKSUM'
     cloud_init: true
@@ -276,6 +284,7 @@ templates:
         - ./uploads/install-qga.sh
 
   - name: rocky-9
+    eol: '2032-05-31'
     url: https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud.latest.x86_64.qcow2
     checksum: '{url}.CHECKSUM'
     cloud_init: true
@@ -287,6 +296,7 @@ templates:
         - ./uploads/install-qga.sh
 
   - name: rocky-10
+    eol: '2035-05-31'
     url: https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud.latest.x86_64.qcow2
     checksum: '{url}.CHECKSUM'
     cloud_init: true
@@ -299,6 +309,7 @@ templates:
 
   # ===== AlmaLinux =====
   - name: almaLinux-8
+    eol: '2029-05-31'
     url: https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/AlmaLinux-8-GenericCloud-latest.x86_64.qcow2
     checksum: '{dir}/CHECKSUM'
     cloud_init: true
@@ -310,6 +321,7 @@ templates:
         - ./uploads/install-qga.sh
 
   - name: almaLinux-9
+    eol: '2032-05-31'
     url: https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2
     checksum: '{dir}/CHECKSUM'
     cloud_init: true
@@ -321,6 +333,7 @@ templates:
         - ./uploads/install-qga.sh
 
   - name: almaLinux-10
+    eol: '2035-05-31'
     url: https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2
     checksum: '{dir}/CHECKSUM'
     cloud_init: true
@@ -347,6 +360,7 @@ templates:
         - ./uploads/install-qga.sh
 
   - name: fedora-43
+    eol: '2026-12-01'
     url: https://download.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2
     discover:
       index: https://download.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/
@@ -361,6 +375,7 @@ templates:
         - ./uploads/install-qga.sh
 
   - name: fedora-44
+    eol: '2027-06-02'
     url: https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2
     discover:
       index: https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/
@@ -375,6 +390,7 @@ templates:
         - ./uploads/install-qga.sh
 
   - name: fedora-45
+    eol: '2027-12-08'
     url: https://download.fedoraproject.org/pub/fedora/linux/releases/45/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-45-1.4.x86_64.qcow2
     discover:
       index: https://download.fedoraproject.org/pub/fedora/linux/releases/45/Cloud/x86_64/images/
@@ -402,6 +418,7 @@ templates:
         - ./uploads/install-qga.sh
 
   - name: opensuse-leap-16.0
+    eol: '2027-10-31'
     url: https://download.opensuse.org/distribution/leap/16.0/appliances/Leap-16.0-Minimal-VM.x86_64-Cloud.qcow2
     checksum: '{url}.sha256'
     cloud_init: true
@@ -432,9 +449,11 @@ templates:
   # ===== Alpine Linux =====
   # Alpine 为 musl/openrc 极简镜像：默认不注入网络调优（net_tuning: false）；qga 走 apk + openrc。
   # 2026-10 起上游去掉了文件名里的 generic_ 前缀（3.22.7 / 3.23.7），discover 两种都认。
-  # 3.24.2+ 的 cloud 镜像文件名里也没有 bios 了（alpine-3.24.3-x86_64-cloudinit-r0.qcow2）：是否仍可用 SeaBIOS 引导
-  # 未经实测，pattern 暂只认带 bios 的变体（停在 3.24.1，安全补丁由构建时 apk upgrade 补上）；实测可用后去掉 -bios。
+  # 3.24.2 起上游不再分 bios / uefi 两个变体（只剩 alpine-3.24.3-x86_64-cloudinit-r0.qcow2，-metal 是裸金属版不要）：
+  # 3.24 的 pattern 两种都认、取版本最高。模板按 SeaBIOS 启动，切换前的开机冒烟会实测它——万一新镜像只能 UEFI 启动，
+  # 构建失败、旧模板原样在役、sync 报 WARN；那时把 3.24 的 url 钉回 generic_alpine-3.24.1-x86_64-bios-cloudinit-r0.qcow2 并删掉 discover。
   - name: alpineLinux-3.22
+    eol: '2027-05-01'
     url: https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/alpine-3.22.7-x86_64-bios-cloudinit-r0.qcow2
     discover:
       index: https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/
@@ -451,6 +470,7 @@ templates:
         - ./uploads/install-qga.sh
 
   - name: alpineLinux-3.23
+    eol: '2027-11-01'
     url: https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/alpine-3.23.7-x86_64-bios-cloudinit-r0.qcow2
     discover:
       index: https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/
@@ -467,10 +487,11 @@ templates:
         - ./uploads/install-qga.sh
 
   - name: alpineLinux-3.24
-    url: https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/cloud/generic_alpine-3.24.1-x86_64-bios-cloudinit-r0.qcow2
+    eol: '2028-06-01'
+    url: https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/cloud/alpine-3.24.3-x86_64-cloudinit-r0.qcow2
     discover:
       index: https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/cloud/
-      pattern: '(?:generic_)?alpine-3\.24\.(\d+)-x86_64-bios-cloudinit-r(\d+)\.qcow2'
+      pattern: '(?:generic_)?alpine-3\.24\.(\d+)-x86_64-(?:bios-)?cloudinit-r(\d+)\.qcow2'
     checksum: '{url}.sha512'
     cloud_init: true
     net_tuning: false

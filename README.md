@@ -156,14 +156,14 @@ python3 import.py <storage-name> <start-vmid> [template-selector] [选项]
 
 - `<storage-name>`：PVE 存储名称（如 `local-lvm`、`local`、`zfs-pool`）
 - `<start-vmid>`：起始 VM ID，例如 900
-- `[template-selector]`：可选，逗号分隔的模板名 / 通配符 / **系列名**（如 `rocky`、`alpine`）。
-  不指定时只导入 `templates.yaml` 中 `default_families` 定义的主流系列（默认 `ubuntu debian centos alpine`），`--all` 导入全部。
+- `[template-selector]`：可选，逗号分隔的模板名 / 通配符 / **系列名**（如 `rocky`、`alpine`）/ **配置组**（`@minimal`）。
+  不指定时导入 `templates.yaml` 的默认配置组 `default_profile`（默认 `@standard`：在售发行版的受支持版本，不含 EOL），`--all` 导入全部。
 
 ### 选项
 
 | 选项 | 说明 |
 |------|------|
-| `--all` | 导入 `templates.yaml` 中的全部模板（忽略 `default_families`） |
+| `--all` | 导入 `templates.yaml` 中的全部模板（含 EOL，忽略 `default_profile`） |
 | `--only-new` | 只导入 PVE 中尚不存在的模板 |
 | `--refresh` | 忽略缓存，强制重新下载镜像 |
 | `--mirror <name>` | 使用 `templates.yaml` 中配置的镜像源（内网环境） |
@@ -287,8 +287,17 @@ python3 update-templates.py 9000 9001 -y
 | openSUSE | opensuse-leap-15.6 (EOL) / 16.0 |
 | Arch Linux | archLinux |
 
-标注「默认」的系列由 `templates.yaml` 的 `default_families` 决定：不指定模板时 `import.py` 只导入这些系列，向导默认勾选这些系列，
-其余系列在向导中按需勾选或用 `--all` / 系列名 / `@profile` 导入。`python3 import.py --list` 可按系列查看全部模板（含 EOL / 自动发现 / 校验标记）。
+默认导入哪些由 `templates.yaml` 的 `default_profile` 决定（默认 `standard`）：不指定模板时 `import.py` 导入这个配置组，向导默认勾选它，
+sync 的 `ADD_MISSING` 在没写 `PROFILE` / `SELECTOR` 时也只补它。
+
+| 配置组 | 内容 | 适用 |
+|---|---|---|
+| `minimal` | debian-13 / 12、ubuntu-24.04 / 22.04、rocky-9、alpineLinux-3.23（6 个） | 小硬盘 / 边缘节点 |
+| `standard`（默认） | debian-13 / 12、ubuntu-26.04 / 24.04 / 22.04、rocky-10 / 9 / 8、almaLinux-10 / 9 / 8、centos-stream-10 / 9、alpineLinux-3.24 / 3.23（15 个） | 常规节点 |
+| `full` | 全部（含 EOL、Fedora、openSUSE、Arch） | 按需 |
+
+组里只放安全支持期内的版本（测试钉死）。`eol` 写成日期（按 [endoflife.date](https://endoflife.date) 的安全支持截止日），到期后 sync 自动
+不再补这个模板、不按年龄重建；届时把它移出组、换上新版本即可。`python3 import.py --list` 按系列列出全部模板（`*` = 默认配置组，含支持期 / EOL / 自动发现 / 校验标记）。
 2026-11-05 全部 27 个地址与校验文件实测可用。
 
 ## 内置定制行为
@@ -375,7 +384,7 @@ mirrors:
 
 ## 自定义模板
 
-编辑 `templates.yaml`。顶层 `default_families` 列出默认导入的系列，`profiles` 定义配置组（`@minimal` / `@standard` / `@full`），
+编辑 `templates.yaml`。顶层 `default_profile` 指定默认导入的配置组，`profiles` 定义配置组（`@minimal` / `@standard` / `@full`），
 `image_mirrors` 定义镜像下载备用站；每个模板支持：
 
 - `name`：模板名称（= PVE VM 名；平台按名字认模板，大小写不敏感。系列由名称前缀自动推断：`ubuntu-24.04` → `ubuntu`、`almaLinux-9` → `alma`）
@@ -385,7 +394,8 @@ mirrors:
   上游改命名（2026-11 CentOS Stream 10、2026-10 Alpine 去掉 `generic_` 前缀）只需改 pattern
 - `checksum`：校验文件地址（`{url}` / `{dir}` 占位）；`checksum_pattern`：校验文件名随构建号变化时（Fedora）在目录里找
 - `upgrade`：构建时是否做包升级（默认 `true`；Arch 滚动镜像为 `false`）
-- `eol`：已停止维护（提示用，不进 minimal / standard 组）
+- `eol`：`true` = 已停止维护，或 `'YYYY-MM-DD'` = 到这天起算（工具按日期判定）；EOL 的不补缺、不按年龄重建，不进 minimal / standard 组。
+  不参与配方指纹（改日期不会触发重建）
 - `cloud_init`：是否启用 cloud-init
 - `net_tuning`：是否注入网络/内核调优（默认 `true`，设 `false` 关闭）
 - `unpack`：解压命令（支持 `{dl}` 和 `{img}` 占位符）

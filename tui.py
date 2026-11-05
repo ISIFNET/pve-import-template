@@ -6,8 +6,8 @@ tui.py - pve-import-template 交互式导入向导
 在终端里一步步选择存储、起始 VMID、要导入的系统模板与各项选项，最后调用 import.py 执行导入。
 
 - 有 whiptail / dialog 时使用对话框界面；否则回退为纯文本菜单（--text 可强制文本模式）。
-- 默认只勾选「主流系列」（templates.yaml 的 default_families：ubuntu / debian / centos / alpine），
-  其他系列（Rocky / Alma / Fedora / openSUSE / Arch ...）作为可选。
+- 默认勾选 templates.yaml 的默认配置组（default_profile，默认 standard：在售发行版的受支持版本，不含 EOL），
+  其余（EOL 版本、Fedora / openSUSE / Arch ...）作为可选；也可一键选小硬盘用的 minimal。
 - 上一次的选择会保存到 ~/.config/pve-import-template/last.json，下次作为默认值。
 - 通过管道执行（curl ... | bash）时会自动接管 /dev/tty。
 
@@ -45,6 +45,7 @@ MIRROR_LABELS = {
 }
 
 PRESET_MAINSTREAM = 'main'
+PRESET_MINIMAL = 'minimal'
 PRESET_ALL = 'all'
 PRESET_FAMILY = 'family'
 PRESET_CUSTOM = 'custom'
@@ -409,6 +410,8 @@ class Wizard:
         self.templates = config.get('templates', [])
         self.mirrors = config.get('mirrors', {}) or {}
         self.defaults = pveimport.default_families(config)
+        self.default_names = pveimport.default_template_names(config)
+        self.default_profile = pveimport.default_profile(config)
         self.used_vmids, self.existing = pveimport.cluster_vm_index()
         self.storages = list_image_storages()
         self.node = local_node_name() or '?'
@@ -424,6 +427,11 @@ class Wizard:
             if fam not in seen:
                 seen.append(fam)
         return seen
+
+    def profile_names(self, profile: str) -> List[str]:
+        if profile not in (self.config.get('profiles') or {}):
+            return []
+        return [t['name'] for t in self.pveimport.match_templates(self.templates, '@' + profile, config=self.config)]
 
     def names_for_families(self, fams: Sequence[str]) -> List[str]:
         fams = {f.lower() for f in fams}
@@ -542,7 +550,10 @@ class Wizard:
         while True:
             current = set(st.get('templates') or [])
             preset_items = [
-                (PRESET_MAINSTREAM, f'主流系列（推荐）：{" / ".join(self.pveimport.family_label(f) for f in self.defaults)}'),
+                (PRESET_MAINSTREAM, f'默认配置组 {self.default_profile}（推荐，{len(self.default_names)} 个）：'
+                                    f'{" / ".join(self.pveimport.family_label(f) for f in self.defaults)}'),
+                *([(PRESET_MINIMAL, f'小硬盘 minimal（{len(self.profile_names("minimal"))} 个）：{", ".join(self.profile_names("minimal"))}')]
+                  if self.profile_names('minimal') and self.default_profile != 'minimal' else []),
                 (PRESET_ALL, f'全部模板（{len(self.templates)} 个）'),
                 (PRESET_FAMILY, '按系列选择（Rocky / Alma / Fedora / openSUSE / Arch ...）'),
                 (PRESET_CUSTOM, '逐个勾选' + (f'（保留当前 {len(current)} 个选择）' if current else '')),
@@ -561,7 +572,9 @@ class Wizard:
         """按预设生成初始勾选并让用户微调；返回 True 表示已确定选择，Cancel 表示回到预设菜单。"""
         st = self.state
         if preset == PRESET_MAINSTREAM:
-            preselected = set(self.names_for_families(self.defaults))
+            preselected = set(self.default_names)
+        elif preset == PRESET_MINIMAL:
+            preselected = set(self.profile_names('minimal'))
         elif preset == PRESET_ALL:
             preselected = {t['name'] for t in self.templates}
         elif preset == PRESET_FAMILY:
@@ -588,6 +601,8 @@ class Wizard:
                     notes.append('已存在')
                 if tpl.get('net_tuning', True) is False:
                     notes.append('无调优')
+                if self.pveimport.pitlib.is_eol(tpl):
+                    notes.append('EOL')
                 desc = f'{fam:<14}' + (f'  [{", ".join(notes)}]' if notes else '')
                 checked = name in preselected and not (skip_existing and name in self.existing)
                 items.append((name, desc, checked))

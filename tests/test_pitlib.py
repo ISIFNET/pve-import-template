@@ -230,8 +230,39 @@ class ConfAndSelectionTest(unittest.TestCase):
             for item in ([items] if isinstance(items, str) else items):
                 if '*' not in item:
                     self.assertIn(item, names, 'profile %s references %s' % (profile, item))
-        minimal = imp.match_templates(cfg['templates'], '@minimal')
-        self.assertTrue(all(not t.get('eol') for t in minimal))
+        # 组里只放还在安全支持期内的版本：变红 = 有版本到了 eol 日期，该把它移出组、换上新版本了（sync 本身已不会再补它）
+        for profile in ('minimal', 'standard'):
+            eol = [t['name'] for t in imp.match_templates(cfg['templates'], '@' + profile, config=cfg) if pitlib.is_eol(t)]
+            self.assertEqual(eol, [], 'profile %s contains end-of-life templates' % profile)
+
+    def test_shipped_eol_values_are_bool_or_dates(self):
+        for t in imp.load_config()['templates']:
+            value = t.get('eol')
+            if value is None or isinstance(value, bool):
+                continue
+            self.assertRegex(str(value), r'^\d{4}-\d{2}-\d{2}$', t['name'])
+            time.strptime(str(value), '%Y-%m-%d')
+
+    def test_default_selection_is_the_default_profile(self):
+        cfg = imp.load_config()
+        self.assertEqual(imp.default_profile(cfg), 'standard')
+        names = imp.default_template_names(cfg)
+        self.assertEqual(names, [t['name'] for t in imp.match_templates(cfg['templates'], '@standard', config=cfg)])
+        self.assertNotIn('ubuntu-18.04', names)   # 旧版「主流系列」按系列选，会把 EOL 的 18.04 / 20.04 / debian-10 一起导进来
+        self.assertIn('rocky-9', names)
+        self.assertEqual(imp.default_families(cfg)[:2], ['ubuntu', 'debian'])
+
+    def test_eol_metadata_does_not_change_the_recipe(self):
+        # 配方变 = 全机队重建；eol 只是支持期元数据（加日期 / 改日期都不该触发）
+        tpl = {'name': 'debian-13', 'url': 'https://d/13.qcow2', 'cloud_init': True}
+        base = imp.recipe_of(tpl, True, True, None)
+        self.assertEqual(imp.recipe_of({**tpl, 'eol': '2030-06-30'}, True, True, None), base)
+        self.assertEqual(imp.recipe_of({**tpl, 'eol': True}, True, True, None), base)
+        self.assertNotEqual(imp.recipe_of({**tpl, 'net_tuning': False}, True, True, None), base)
+
+    def test_default_selection_without_profiles_falls_back_to_supported_templates(self):
+        cfg = {'templates': [{'name': 'debian-10', 'eol': True}, {'name': 'debian-13', 'eol': '2030-06-30'}, {'name': 'archLinux'}]}
+        self.assertEqual(imp.default_template_names(cfg), ['debian-13', 'archLinux'])
 
     def test_match_templates_case_insensitive(self):
         tpls = [{'name': 'alpineLinux-3.22'}, {'name': 'debian-13'}]

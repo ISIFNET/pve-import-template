@@ -2,13 +2,26 @@
 
 本文件记录对 pve-import-template 的主要改动。
 
+## [2.1.0] - 2026-11-06
+
+### 默认导入哪些系统
+
+- 新增 `default_profile`（默认 `standard`），取代按系列的 `default_families`：`import.py` 不指定模板、`tui.py` 向导默认勾选、
+  sync 的 `ADD_MISSING`（没写 `PROFILE` / `SELECTOR` 时）都用它。旧版按系列选会把 EOL 的 ubuntu-18.04 / 20.04、debian-10 / 11 一起导进来。
+- 配置组按支持期重排：`minimal` 加 rocky-9（小硬盘也有一个 EL）；`standard` 加 rocky-8 / almaLinux-8（安全支持到 2029-05），
+  去掉 alpineLinux-3.22（2027-05 EOL）。测试钉死组里没有 EOL 模板。
+- `eol` 改为日期（endoflife.date 的安全支持截止日）：到期自动生效，不用再改 yaml；`--list` 显示「支持到」。
+  `eol` 不参与配方指纹——改日期不会触发全机队重建。
+- Alpine 3.24：上游 3.24.2 起不再分 bios / uefi 变体，discover 两种命名都认（停在 3.24.1 的限制去掉），
+  能否 SeaBIOS 启动由切换前的开机冒烟实测；向导多一个「小硬盘 minimal」预设。
+
 ## [2.0.0] - 2026-11-05
 
 ### 新增 sync-templates.py：模板持续更新（蓝绿重建）
 
 - **新建 → 切换 → 回收**：不再就地改模板基卷（链接克隆共享基卷，就地写要么被拒、要么不进新克隆、要么改坏已有克隆）。
   新模板构建完全成功后才接管名字，旧模板改名 `<name>-retired-<时间>` + tag `pit-retired`，保留 `KEEP_RETIRED` 代，
-  更早的在退役满 1 小时、无链接克隆、无 protection、未加锁时删除。
+  更早的在退役满 12 小时、无链接克隆、无 protection、未加锁时删除。
 - **重建判断**：forced / source-changed / stale（默认 30 天）/ recipe-changed（yaml 条目 + 注入脚本 + 工具版本指纹）/ legacy / missing；
   `--max-builds` 限流，按优先级排序；失败按配方指数退避（404 固定 7 天，改了 yaml 立即重试）。
 - 非交互、`--json`、`--dry-run`、`--list`；状态文件 `/var/lib/pve-import-template/last-run.json`；节点级 flock（三个工具互斥）；

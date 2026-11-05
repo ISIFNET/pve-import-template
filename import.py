@@ -10,7 +10,8 @@ import.py - Proxmox VE Cloud Image Importer
 - 上游校验：模板配置了 checksum 时下载后核对 SHA256/SHA512；配置了 discover 时自动找最新点版本
 - 离线定制（virt-customize）：换源 → 包升级 → 模板 customize → 网络调优 → 注入校验 → 清理（sysprep）
 - 模板 VM 带 tags（pit / pit-bYYYYMMDD）与 description 里的构建元数据，供 sync-templates.py 与平台识别
-- 默认只导入「主流系列」（templates.yaml 的 default_families）；--all 导入全部；选择器也支持系列名
+- 默认导入 templates.yaml 的 default_profile 配置组（standard：在售发行版的受支持版本，不含 EOL）；--all 导入全部；
+  选择器支持模板名 / glob / 系列名 / @profile（小硬盘 @minimal）
 - --bridge / --memory / --cores 自定义模板 VM 默认硬件；--dry-run 仅打印导入计划
 
 用法
@@ -20,6 +21,7 @@ import.py - Proxmox VE Cloud Image Importer
   python3 import.py local-lvm 9001
   python3 import.py local-lvm 9001 --all
   python3 import.py local-lvm 9001 --only-new
+  python3 import.py local-lvm 9001 @minimal
   python3 import.py local-lvm 9001 ubuntu-22.04,ubuntu-20.04
   python3 import.py local-lvm 9001 'ubuntu-*'
   python3 import.py local-lvm 9001 rocky,alpine
@@ -90,8 +92,8 @@ MAX_IMAGE_BYTES = 8 * 1024 ** 3
 # 模板名会进 qm --name、缓存文件名、import-from 路径：只许 DNS 名字符
 TEMPLATE_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9.-]{0,40}$')
 
-# 未在 templates.yaml 里声明 default_families 时的默认主流系列
-DEFAULT_FAMILIES = ['ubuntu', 'debian', 'centos', 'alpine']
+# 未在 templates.yaml 里声明 default_profile 时的默认配置组（不指定模板时导入它、向导默认勾选它）
+DEFAULT_PROFILE = 'standard'
 
 # 系列显示名（--list / TUI 用）
 FAMILY_LABELS = {
@@ -136,11 +138,27 @@ def template_family(template: dict) -> str:
     return fam or 'other'
 
 
+def default_profile(config: dict) -> str:
+    return str(config.get('default_profile') or DEFAULT_PROFILE)
+
+
+def default_template_names(config: dict) -> list:
+    """默认配置组展开成模板名（保持 templates.yaml 顺序）。组没定义时退回全部非 EOL 模板，而不是一个都不导。"""
+    tpls = config.get('templates', []) or []
+    if default_profile(config) not in (config.get('profiles') or {}):
+        return [t['name'] for t in tpls if not pitlib.is_eol(t)]
+    return [t['name'] for t in match_templates(tpls, '@' + default_profile(config), config=config)]
+
+
 def default_families(config: dict) -> list:
-    fams = config.get('default_families')
-    if not fams:
-        return list(DEFAULT_FAMILIES)
-    return [str(f).lower() for f in fams]
+    """默认配置组涉及的系列（--list / 向导的「默认」标记用）。"""
+    names = set(default_template_names(config))
+    fams = []
+    for t in config.get('templates', []) or []:
+        fam = template_family(t)
+        if t['name'] in names and fam not in fams:
+            fams.append(fam)
+    return fams
 
 
 def family_label(family: str) -> str:
@@ -735,7 +753,7 @@ def download_with_cache(name: str, url: str, unpack_cmd: Optional[str] = None, r
     return img
 
 
-def match_templates(all_tpls: list, filter_expr: Optional[str], families: Optional[list] = None) -> list:
+def match_templates(all_tpls: list, filter_expr: Optional[str], families: Optional[list] = None, config: Optional[dict] = None) -> list:
     """支持逗号分隔 / 通配 / 系列名的模板选择（模板名大小写不敏感）。
 
     - filter_expr 为空时：families 为 None 返回全部，否则只返回属于这些系列的模板。
@@ -743,7 +761,7 @@ def match_templates(all_tpls: list, filter_expr: Optional[str], families: Option
     - @profile 展开成 templates.yaml profiles 里的列表（如 @minimal：小硬盘节点只要几个主流模板）。
     """
     if filter_expr and '@' in filter_expr:
-        filter_expr = pitlib.expand_profiles(filter_expr, load_config())
+        filter_expr = pitlib.expand_profiles(filter_expr, config if config is not None else load_config())
     if not filter_expr:
         if families is None:
             return list(all_tpls)
@@ -802,6 +820,7 @@ def recipe_of(template: dict, apply_tuning: bool, upgrade: bool, mirror_name: Op
                         'upgrade': upgrade_enabled(template, upgrade), 'mirror': mirror_name or ''}
     tpl.pop('url', None)       # 地址变化由 source 比对负责（discover 会让 url 每个点版本都变）
     tpl.pop('discover', None)
+    tpl.pop('eol', None)       # 支持期是元数据、不影响镜像内容：改个日期不能让全机队把这个模板重建一遍
     return pitlib.recipe_hash(tpl, files, RECIPE_VERSION)
 
 
@@ -1063,12 +1082,12 @@ def print_summary(results: dict):
 
 USAGE = '''Usage: python3 import.py <storage-name> <start-vmid> [template-name[,name2|glob|family]] [options]
 
-不指定模板时，默认只导入「主流系列」（templates.yaml 中 default_families，
-默认为 ubuntu/debian/centos/alpine）；--all 导入全部。选择器可写模板名、glob 通配或系列名。
+不指定模板时导入 templates.yaml 的默认配置组（default_profile，默认 @standard：在售发行版的受支持版本，
+不含 EOL）；--all 导入全部。选择器可写模板名、glob 通配、系列名或 @profile（小硬盘节点用 @minimal）。
 已存在的模板要换成新构建，请用 sync-templates.py。
 
 Options:
-  --all               导入 templates.yaml 中的全部模板（忽略 default_families）
+  --all               导入 templates.yaml 中的全部模板（含 EOL，忽略 default_profile）
   --only-new          只导入本节点尚不存在的模板
   --refresh           忽略缓存，强制重新下载镜像
   --mirror <name>     使用 templates.yaml 中配置的镜像源（内网环境）
@@ -1087,6 +1106,7 @@ Examples:
   python3 import.py local-lvm 9001
   python3 import.py local-lvm 9001 --all
   python3 import.py local-lvm 9001 --only-new
+  python3 import.py local-lvm 9001 @minimal
   python3 import.py local-lvm 9001 'ubuntu-*',rocky --mirror tsinghua
   python3 import.py local-lvm 9001 --bridge vmbr1 --memory 1024 --cores 2
   python3 import.py --list'''
@@ -1113,17 +1133,22 @@ def print_template_list():
     config = load_config()
     _, existing = cluster_vm_index()
     existing_lower = {n.lower() for n in existing}
-    defaults = default_families(config)
+    defaults = set(default_template_names(config))
     groups = {}
     for t in config.get('templates', []):
         groups.setdefault(template_family(t), []).append(t)
-    print('可用模板（templates.yaml）：  * = 默认导入的主流系列')
+    profile = default_profile(config)
+    print(f'可用模板（templates.yaml）：  * = 默认配置组 @{profile}（不指定模板时导入）')
     for fam, tpls in groups.items():
-        mark = '*' if fam in defaults else ' '
-        print(f'\n{mark} {family_label(fam)} ({fam})')
+        print(f'\n  {family_label(fam)} ({fam})')
         for t in tpls:
             name = t['name']
+            mark = '*' if name in defaults else ' '
             flags = []
+            if pitlib.is_eol(t):
+                flags.append('EOL')
+            elif isinstance(t.get('eol'), str):
+                flags.append(f'支持到 {t["eol"]}')
             if name.lower() in existing_lower:
                 flags.append('已存在')
             if t.get('net_tuning', True) is False:
@@ -1135,8 +1160,9 @@ def print_template_list():
             if t.get('checksum'):
                 flags.append('校验')
             suffix = f'  [{", ".join(flags)}]' if flags else ''
-            print(f'    - {name}{suffix}')
-    print(f'\n默认系列：{", ".join(defaults)}（--all 导入全部；选择器可直接写系列名）')
+            print(f'  {mark} - {name}{suffix}')
+    others = ', '.join('@' + p for p in (config.get('profiles') or {}) if p != profile)
+    print(f'\n默认配置组 @{profile}：{len(defaults)} 个（--all 导入全部；其他配置组：{others or "无"}；选择器也可写系列名）')
     mirrors = config.get('mirrors', {})
     if mirrors:
         print(f'可用镜像源：{", ".join(mirrors.keys())}')
@@ -1251,10 +1277,10 @@ def main():
         mirror_config = mirrors[mirror_name]
         print(f'Using mirror: {mirror_name}')
 
-    families = None if (import_all or template_filter) else default_families(config)
-    if families is not None:
-        print(f'未指定模板：默认只导入主流系列 {", ".join(families)}（--all 导入全部）。')
-    to_import_all = match_templates(all_tpls, template_filter, families)
+    if not (import_all or template_filter):
+        template_filter = ','.join(default_template_names(config))
+        print(f'未指定模板：导入默认配置组 @{default_profile(config)}（{template_filter}；--all 导入全部，@minimal 给小硬盘）。')
+    to_import_all = match_templates(all_tpls, template_filter)
     if not to_import_all:
         print('No templates matched. Use --list to see available templates.')
         sys.exit(1)
