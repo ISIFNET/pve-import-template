@@ -2,6 +2,59 @@
 
 本文件记录对 pve-import-template 的主要改动。
 
+## [2.0.0] - 2026-11-05
+
+### 新增 sync-templates.py：模板持续更新（蓝绿重建）
+
+- **新建 → 切换 → 回收**：不再就地改模板基卷（链接克隆共享基卷，就地写要么被拒、要么不进新克隆、要么改坏已有克隆）。
+  新模板构建完全成功后才接管名字，旧模板改名 `<name>-retired-<时间>` + tag `pit-retired`，保留 `KEEP_RETIRED` 代，
+  更早的在退役满 1 小时、无链接克隆、无 protection、未加锁时删除。
+- **重建判断**：forced / source-changed / stale（默认 30 天）/ recipe-changed（yaml 条目 + 注入脚本 + 工具版本指纹）/ legacy / missing；
+  `--max-builds` 限流，按优先级排序；失败按配方指数退避（404 固定 7 天，改了 yaml 立即重试）。
+- 非交互、`--json`、`--dry-run`、`--list`；状态文件 `/var/lib/pve-import-template/last-run.json`；节点级 flock（三个工具互斥）；
+  SIGTERM 走清理；systemd timer（`install-timer.sh` / `bash run.sh timer install`）；节点配置 `/etc/pve-import-template.conf`（严格解析，不经 shell）。
+- **profiles**（`@minimal` / `@standard` / `@full`）：小硬盘节点只维护几个主流模板；构建前检查缓存目录与目标存储剩余空间；
+  `KEEP_CACHE=0`（默认）构建完删缓存镜像。
+
+### 构建流水线（import.py 与 sync 共用）
+
+- 缓存镜像保持上游原样，定制只在副本上做（旧版直接定制缓存，下次复用时脚本叠加执行、sed 叠两遍）。
+- **包升级**（`uploads/upgrade-packages.sh`，apt/dnf/yum/zypper/apk/pacman，失败即构建失败；EOL 只在源确实不可用时切归档源）。
+- **注入校验**（`uploads/verify-image.sh`）：qga 已装且自启、`sshd -T` 生效配置 permitrootlogin=yes，不达标构建失败。
+- **封装清理**（`uploads/finalize-image.sh`）：SSH host key、machine-id、cloud-init 状态、随机种子、pacman 临时 keyring、日志、包缓存、历史。
+- 模板 tags（`pit` / `pit-bYYYYMMDD`）+ description 元数据；镜像内写 `/etc/pve-template-release`。
+- `qm set --scsi0 <storage>:0,import-from=…` 一步导入挂盘（旧版写死 `disk-0`，存储上有残留盘时挂错盘）；`--boot order=scsi0`。
+- 上游校验和（SHA256/SHA512，GNU / BSD / 单 hash），`discover` 自动找最新点版本，`image_mirrors` 备用下载站；下载有超时、
+  只对瞬时故障重试、失败分类；ETag 不同但 Last-Modified 相同不再误判「没变」；缓存元数据记 URL。
+- RHEL / Fedora / SUSE 构建加 `--selinux-relabel`；appliance 起不来才回退 TCG（脚本出错不再整套重跑）。
+- VMID 分配把 LXC 算进占用；失败的号跳过不再连环失败；`--only-new` 只看本节点；多个选择器合并。
+
+### templates.yaml
+
+- 全部模板配上校验和；CentOS Stream 9/10 改 discover（2026-11 上游改名，旧 10-stream 地址 502）；Alpine 3.22/3.23 discover
+  （自动用上 3.22.7 / 3.23.7，2026-10 上游去掉 `generic_` 前缀）；Fedora 43/44/45 discover（新增 45，42 标 eol）；
+  Arch `upgrade: false`；EOL 版本标 `eol: true`；新增 `profiles`、`image_mirrors`（TUNA：Ubuntu cloud images / Alpine）。
+
+### 审查加固（同日）
+
+- **切换前开机冒烟**：新模板链接克隆一台不接网卡的临时 VM，`SMOKE_TIMEOUT` 内 qemu-guest-agent 不应答 = 构建失败（防包升级弄坏引导后自动上线）。
+- VMID 单调分配（高水位记在状态文件），`qm create` 前一刻才分配、撞号换号；退役时间戳取改名那一刻，宽限期 12h；GC 只认 `pit-retired` + 可解析时间戳，
+  不再带 `--destroy-unreferenced-disks`；只管理 VMID 区间内的模板；同名多个在役时补退役；改名撞克隆锁退避重试。
+- discover 只往上走、同版本按文件名定序；决策用的 URL 直接交给构建；有校验文件时按上游 hash 判断是否重新发布。
+- 镜像 `qemu-img info` 核对格式 / backing file / data-file，virt-customize 显式 `--format`，单镜像 8 GiB 上限，TCG 重试从干净副本开始。
+- 选择器不得以 `-` 开头、argparse 不认缩写（防止拼出 `--insecure` 之类的选项）；配置非法 / 缺依赖也写状态文件。
+- openSUSE Leap 16（主配置在 `/usr/etc/ssh`）写 drop-in；deb822 归档切换只删 `*-updates` 套件；verify 增加 cloud-init 检查；被强杀的半成品 / 冒烟 VM / 工作副本自动清理。
+
+### 修复
+
+- Debian `--mirror` 拼出 `…/debian/debian`（换源后 apt 全挂）；Fedora 不再套 RHEL 换源规则；RHEL 换源认 `metalink` 与 `# baseurl`。
+- `install-qga.sh` 不再对所有 Debian 永久关闭 Valid-Until、不再把在支持期的 Ubuntu 改到 old-releases。
+- `permit-root-login.sh` 改 drop-in / 首行写入，去掉行尾注释。
+- `update-templates.py`：默认网络调优尊重 yaml 的 `net_tuning: false`（Alpine）；失败日志改到 0700 目录、O_EXCL 打开
+  （旧版写 `/tmp` 下可预测路径）；与其它工具共用节点锁。
+- 默认起始 VMID 9000 → 9001（rhapsi 平台只识别 9001-9999）。
+- 新增 `tests/`（stdlib unittest：`python3 -m unittest discover -s tests`）。
+
 ## [Unreleased] - 2026-09-24
 
 ### 交互式向导与默认只导入主流系列

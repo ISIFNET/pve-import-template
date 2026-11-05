@@ -2,11 +2,65 @@
 
 自动化导入 Cloud-init 镜像到 Proxmox VE 的工具。支持 Ubuntu、Debian、CentOS Stream、Rocky Linux、AlmaLinux、Fedora、openSUSE、Arch Linux、Alpine Linux 等主流发行版。
 
-包含三个工具：
+包含四个工具：
 
+- **`sync-templates.py`** —— **让模板保持最新（推荐的日常方式）**：发现上游新镜像 / 构建过期 / 注入方式变化时，
+  **新建**一个模板、构建完全成功后才接管名字，旧模板退役保留一代用于回滚，过宽限期且无链接克隆后再删。
+  非交互、JSON 输出、节点级锁，可由 systemd timer 每日运行（`bash run.sh timer install`）或由 rhapsi 平台下发。
 - **`tui.py`** —— 交互式向导（`run.sh` 默认入口）：入口菜单选「导入新模板」或「更新已导入模板」，一步步选择后调用下面两个工具。
 - **`import.py`** —— 下载云镜像、离线定制、创建并转换为 PVE 模板。默认只导入主流系列（Ubuntu / Debian / CentOS Stream / Alpine），其余系列按需选择。
-- **`update-templates.py`** —— 对**已经导入**的模板就地重新应用定制（网络调优 / qemu-guest-agent / 允许 root 登录等），**无需重新下载或重建模板**。
+- **`update-templates.py`** —— 对**已经导入**的模板就地重新应用定制（网络调优 / qemu-guest-agent / 允许 root 登录等）。
+  就地修改模板基卷对链接克隆有风险，换新构建请优先用 `sync-templates.py`。
+
+### 每次构建都会做的事（import / sync 共用）
+
+1. 下载上游镜像（缓存保持**上游原样**，定制只在副本上做）；配了 `checksum` 的核对 SHA256/SHA512，配了 `discover` 的自动找最新点版本；
+   主站失败按 `image_mirrors` 试备用站；下载有超时与重试，失败分类（404 / 网络 / TLS / 校验 / 空间）。
+2. 镜像内：换源（可选）→ **包升级到最新安全补丁**（`upgrade-packages.sh`，失败即构建失败）→ ssh / root 登录 / qga →
+   网络调优 → 写 `/etc/pve-template-release` → **注入校验**（`verify-image.sh`：qga 已装且自启、`sshd -T` 生效配置允许 root）
+   → **封装清理**（`finalize-image.sh`：SSH host key、machine-id、cloud-init 状态、随机种子、日志、包缓存、shell 历史）。
+3. `qm create` + `import-from` 一步导入挂盘，打 tags（`pit` / `pit-bYYYYMMDD`）并在 description 写构建元数据
+   （来源 URL、sha256、校验结果、配方指纹、工具版本）——平台据此显示每台节点上模板的构建日期。
+
+## sync-templates.py —— 让模板保持最新
+
+```bash
+python3 sync-templates.py --dry-run                 # 看计划：哪些模板会重建、为什么
+python3 sync-templates.py                           # 按需重建（默认每轮最多 3 个，只处理本节点已有的模板）
+python3 sync-templates.py alpine --force            # 立即重建本节点所有 Alpine 模板（安全事件）
+python3 sync-templates.py @minimal --add-missing --storage local-lvm   # 小硬盘节点：只要 minimal 组，缺的补上
+python3 sync-templates.py --list [--json]           # 本节点模板：在役 / 退役 / 旧工具导入（legacy）、构建时间、来源
+bash run.sh timer install                           # 每日 03:30 起随机延迟 3h 自动 sync（配置 /etc/pve-import-template.conf）
+bash run.sh timer status                            # 最近一次结果
+```
+
+**什么时候重建**（按优先级，`--max-builds` 限流，其余记 `deferred` 下一轮再建）：`forced` → `source-changed`（上游新镜像）
+→ `stale`（超过 `MAX_AGE_DAYS`，默认 30 天，拿包升级里的安全补丁）→ `recipe-changed`（templates.yaml 条目 / 注入脚本 / 工具版本变了）
+→ `legacy`（旧工具导入、没有元数据）→ `missing`（仅 `--add-missing`）。
+
+**切换与回收**：新模板先以 `<name>-pitbuild` 构建并转成模板，**开机冒烟**通过（从它链接克隆一台不接网卡的临时 VM，
+`SMOKE_TIMEOUT` 秒内 qemu-guest-agent 必须应答，随后销毁——包升级在 chroot 里动了内核 / grub / extlinux，只有真开机才知道还能不能起）
+后才改名为 `<name>`，再把旧模板改名 `<name>-retired-<退役那一刻的 UTC 时间>` 并打 `pit-retired`（两步之间两个同名模板都可克隆，没有空窗；
+旧模板正被克隆时改名会撞锁，退避重试约 5 分钟，仍不行下一轮补退役）。每个模板保留最新 `KEEP_RETIRED`（默认 1）个退役版本用于回滚；
+更早的在**退役满 12 小时、没有链接克隆引用、没开 protection、没被锁、带 `pit-retired` tag** 时才删除（手工起名的 `*-retired-*` 永远不动）。
+只管理 VMID 在 `VMID_MIN`-`VMID_MAX` 之内的模板；新模板 VMID **单调往上分配**（不回填回收掉的号——号被别的系统复用，只记了 VMID 的
+平台服务会装错系统），并在 `qm create` 前一刻才分配、撞号换号重试。任何一步失败旧模板原样在役。
+
+**上游是否变化**：discover 找到更高的点版本（只往上走：落后的备用站 / 旧缓存给出的更低版本不算）；同一地址有校验文件时比上游 hash
+（Fedora / openSUSE / Arch 的 HEAD 会被重定向到不同镜像站，ETag 不可靠），没有才比 ETag / Last-Modified。下载的镜像必须是
+qcow2 / raw 且不带 backing file / 外部 data-file（`qemu-img info` 核对），单个镜像上限 8 GiB。
+
+**失败处理**：单模板失败隔离；同一配方连续失败按 `BACKOFF_HOURS`（默认 20h，配合每日 timer）翻倍退避（封顶 7 天），上游 404 固定退避 7 天；
+改了 templates.yaml（url / discover / 配方）立即重试；`--force` 无视退避。UEFI（OVMF）模板记 `skipped`（不自动重建、不算失败）。
+被强杀留下的构建半成品 / 冒烟 VM / 工作副本由下一轮清掉（逐条核对 pit tag 与构建元数据，不只看名字）。结果写 `/var/lib/pve-import-template/last-run.json`，
+日志在 `/var/log/pve-import-template/`（0700）。退出码：0 成功 / 1 有失败 / 2 用法或依赖 / 3 另一个实例在跑 / 130 被中断。
+
+**节点配置** `/etc/pve-import-template.conf`（见 `pve-import-template.conf.example`，KEY=VALUE、不经 shell）：
+`PROFILE` / `SELECTOR`（维护哪些）、`ADD_MISSING` + `STORAGE`、`MAX_AGE_DAYS`、`MAX_BUILDS`、`KEEP_RETIRED`、
+`KEEP_CACHE`（默认 0：构建完删缓存镜像）、`UPGRADE`、`NET_TUNING`、`MIRROR`、`VMID_MIN/MAX`（默认 9001-9999）、`BACKOFF_HOURS`。
+
+**小硬盘节点**：`PROFILE=minimal`（debian-13 / debian-12 / ubuntu-24.04 / ubuntu-22.04 / alpineLinux-3.23）+ `KEEP_RETIRED=0`
++ `KEEP_CACHE=0`；构建前会检查缓存目录与目标存储的剩余空间，不够就记 `insufficient space` 失败而不是写满磁盘。
 
 > 变更历史见 [CHANGELOG.md](./CHANGELOG.md)。
 
@@ -223,18 +277,19 @@ python3 update-templates.py 9000 9001 -y
 
 | 系列 | 模板 |
 |------|------|
-| Ubuntu（默认） | ubuntu-18.04 / 20.04 / 22.04 / 24.04 / **26.04** |
-| Debian（默认） | debian-10 / 11 / 12 / 13 |
-| CentOS Stream（默认） | centos-stream-9 / 10（stream-8 已 EOL，默认注释） |
-| Alpine Linux（默认） | alpineLinux-3.22 / 3.23 / 3.24 |
+| Ubuntu（默认） | ubuntu-18.04 (EOL) / 20.04 (EOL) / 22.04 / 24.04 / **26.04** |
+| Debian（默认） | debian-10 (EOL) / 11 (EOL) / 12 / 13 |
+| CentOS Stream（默认） | centos-stream-9 / 10（自动找最新带日期构建） |
+| Alpine Linux（默认） | alpineLinux-3.22 / 3.23 / 3.24（自动找最新点版本） |
 | Rocky Linux | rocky-8 / 9 / 10 |
 | AlmaLinux | almaLinux-8 / 9 / 10 |
-| Fedora | fedora-42 / 43 / 44 |
-| openSUSE | opensuse-leap-15.6 / 16.0 |
+| Fedora | fedora-42 (EOL) / 43 / 44 / **45**（自动找当前构建号） |
+| openSUSE | opensuse-leap-15.6 (EOL) / 16.0 |
 | Arch Linux | archLinux |
 
 标注「默认」的系列由 `templates.yaml` 的 `default_families` 决定：不指定模板时 `import.py` 只导入这些系列，向导默认勾选这些系列，
-其余系列在向导中按需勾选或用 `--all` / 系列名导入。`python3 import.py --list` 可按系列查看全部模板。
+其余系列在向导中按需勾选或用 `--all` / 系列名 / `@profile` 导入。`python3 import.py --list` 可按系列查看全部模板（含 EOL / 自动发现 / 校验标记）。
+2026-11-05 全部 27 个地址与校验文件实测可用。
 
 ## 内置定制行为
 
@@ -242,11 +297,14 @@ python3 update-templates.py 9000 9001 -y
 
 ### 允许 root 登录（`permit-root-login.sh`）
 
-所有模板默认允许 root 登录并启用密码认证（配合 `uploads/ssh.cfg`），便于初始化。
+所有模板默认允许 root 登录并启用密码认证（配合 `uploads/ssh.cfg`），便于初始化。sshd 对同一关键字首条生效：
+有 `Include sshd_config.d/*.conf` 的发行版写排在最前的 drop-in `00-pve-template-root.conf`，老发行版把设置放到主配置第一行
+（旧版追加在末尾，可能落进 `Match` 块；行尾注释在旧 OpenSSH 上会让 sshd 起不来）。是否生效由 `verify-image.sh` 用 `sshd -T` 核对。
 
 ### qemu-guest-agent（`install-qga.sh`）
 
-自动适配多发行版：Debian/Ubuntu（含 EOL，自动切 archive 源）、RHEL/CentOS/Rocky/Alma（dnf/yum/microdnf）、
+自动适配多发行版：Debian/Ubuntu（先按自带源安装，**只有源确实不可用（已归档）才**切 archive / old-releases 并关闭 Valid-Until 校验；
+旧版对所有 Ubuntu 无条件改到 old-releases，22.04 因此装不上 qga）、RHEL/CentOS/Rocky/Alma（dnf/yum/microdnf）、
 openSUSE（zypper）、Arch（pacman）、**Alpine（apk + openrc）**。安装失败不会中断导入。
 
 ### 网络/内核调优（`apply-net-tuning.sh`，**默认对所有模板开启**）
@@ -317,11 +375,17 @@ mirrors:
 
 ## 自定义模板
 
-编辑 `templates.yaml`。顶层 `default_families` 列出默认导入的系列；每个模板支持：
+编辑 `templates.yaml`。顶层 `default_families` 列出默认导入的系列，`profiles` 定义配置组（`@minimal` / `@standard` / `@full`），
+`image_mirrors` 定义镜像下载备用站；每个模板支持：
 
-- `name`：模板名称（系列由名称前缀自动推断：`ubuntu-24.04` → `ubuntu`、`almaLinux-9` → `alma`）
+- `name`：模板名称（= PVE VM 名；平台按名字认模板，大小写不敏感。系列由名称前缀自动推断：`ubuntu-24.04` → `ubuntu`、`almaLinux-9` → `alma`）
 - `family`：可选，显式指定系列名
-- `url`：镜像下载地址
+- `url`：镜像下载地址（配了 `discover` 时作为兜底）
+- `discover`：`{index, pattern}`，在目录索引里按正则（整个文件名、捕获组按数字比较）找最新点版本——
+  上游改命名（2026-11 CentOS Stream 10、2026-10 Alpine 去掉 `generic_` 前缀）只需改 pattern
+- `checksum`：校验文件地址（`{url}` / `{dir}` 占位）；`checksum_pattern`：校验文件名随构建号变化时（Fedora）在目录里找
+- `upgrade`：构建时是否做包升级（默认 `true`；Arch 滚动镜像为 `false`）
+- `eol`：已停止维护（提示用，不进 minimal / standard 组）
 - `cloud_init`：是否启用 cloud-init
 - `net_tuning`：是否注入网络/内核调优（默认 `true`，设 `false` 关闭）
 - `unpack`：解压命令（支持 `{dl}` 和 `{img}` 占位符）
