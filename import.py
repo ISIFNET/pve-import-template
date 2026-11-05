@@ -6,46 +6,27 @@ import.py - Proxmox VE Cloud Image Importer
 功能亮点
 - 仅导入“新增模板”：--only-new
 - 选择性导入：支持逗号分隔或通配（glob），例如：'ubuntu-*'
-- 下载缓存：对比 ETag/Last-Modified，无变化则跳过下载
-- 支持模板自定义 unpack（占位符 {dl} / {img}）
-- 离线定制：virt-customize（请在 templates.yaml 里使用你更新后的 *command_install_qga）
-- 保留原有 cloud-init 选项设置
-- 默认保留下载好的镜像文件；--refresh 可强制重下并覆盖缓存
-- 所有外部命令失败会抛出异常（更快发现问题）
-- 支持自定义镜像源：--mirror <mirror-name> 可为内网环境配置软件源
-- TLS 证书校验失败时不再无谓重试，直接给出排障提示；--insecure 可临时跳过校验
-- 默认只导入「主流系列」（templates.yaml 的 default_families，默认 ubuntu/debian/centos/alpine）；
-  --all 导入全部；模板选择器也支持直接写系列名（如 rocky、alpine）
+- 下载缓存：按 URL + ETag/Last-Modified 判断是否变化；缓存镜像保持「上游原样」，定制只作用在副本上
+- 上游校验：模板配置了 checksum 时下载后核对 SHA256/SHA512；配置了 discover 时自动找最新点版本
+- 离线定制（virt-customize）：换源 → 包升级 → 模板 customize → 网络调优 → 注入校验 → 清理（sysprep）
+- 模板 VM 带 tags（pit / pit-bYYYYMMDD）与 description 里的构建元数据，供 sync-templates.py 与平台识别
+- 默认只导入「主流系列」（templates.yaml 的 default_families）；--all 导入全部；选择器也支持系列名
 - --bridge / --memory / --cores 自定义模板 VM 默认硬件；--dry-run 仅打印导入计划
 
 用法
   python3 import.py <storage-name> <start-vmid> [template-name[,name2|glob|family]] [options]
 
 示例
-  # 导入主流系列（从 900 开始编号）
-  python3 import.py local-lvm 900
+  python3 import.py local-lvm 9001
+  python3 import.py local-lvm 9001 --all
+  python3 import.py local-lvm 9001 --only-new
+  python3 import.py local-lvm 9001 ubuntu-22.04,ubuntu-20.04
+  python3 import.py local-lvm 9001 'ubuntu-*'
+  python3 import.py local-lvm 9001 rocky,alpine
+  python3 import.py local-lvm 9001 ubuntu-22.04 --refresh
+  python3 import.py local-lvm 9001 --mirror aliyun
 
-  # 导入 templates.yaml 中的全部模板
-  python3 import.py local-lvm 900 --all
-
-  # 只导入 PVE 里还不存在的模板
-  python3 import.py local-lvm 900 --only-new
-
-  # 只导入指定两个模板
-  python3 import.py local-lvm 900 ubuntu-22.04,ubuntu-20.04
-
-  # 使用通配 / 系列名导入一批
-  python3 import.py local-lvm 900 'ubuntu-*'
-  python3 import.py local-lvm 900 rocky,alpine
-
-  # 强制刷新镜像（无视缓存，重新下载）
-  python3 import.py local-lvm 900 ubuntu-22.04 --refresh
-
-  # 使用内网镜像源（在 templates.yaml 的 mirrors 中配置）
-  python3 import.py local-lvm 900 --mirror aliyun
-
-  # 组合使用：导入 ubuntu 系列模板，使用清华镜像源
-  python3 import.py local-lvm 900 'ubuntu-*' --mirror tsinghua
+已导入的模板要「换成新构建」请用 sync-templates.py（新建 → 切换 → 回收旧模板），不要删了重导。
 """
 
 import sys
@@ -53,6 +34,7 @@ import os
 import atexit
 import contextlib
 import ssl
+import shutil
 import time
 import urllib.error
 import urllib.request
@@ -61,25 +43,52 @@ import json
 import fnmatch
 import re
 import tempfile
-from typing import Iterable, Tuple, Optional
+from typing import Tuple, Optional
 
 try:
-    import tqdm
     import yaml
 except ImportError:
-    print('Some dependencies are missing.')
+    print('Some dependencies are missing (python3-yaml).')
     print('Please run setup.sh to install them.')
     sys.exit(2)
+
+try:
+    import tqdm  # 只用于交互终端的下载进度条；没有也能跑
+except ImportError:
+    tqdm = None
+
+import pitlib
 
 # 脚本所在目录（保证无论从哪个工作目录调用都能找到 uploads/ 等资源）
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+with open(os.path.join(SCRIPT_DIR, 'VERSION'), 'r') as _fh:
+    TOOL_VERSION = _fh.read().strip()
+
+# 进配方指纹的「构建流程版本」：只在构建步骤 / 注入方式变了时手动加一。不用 TOOL_VERSION——改个文档发版也会让
+# 全机队所有模板判 recipe-changed、排着队重建（2026-11-05 审查）
+RECIPE_VERSION = '2'
+
+
 # 网络/内核 sysctl 调优脚本（import 与 update-templates.py 共用，单一数据源）
 TUNING_SCRIPT = os.path.join(SCRIPT_DIR, 'uploads', 'apply-net-tuning.sh')
+UPGRADE_SCRIPT = os.path.join(SCRIPT_DIR, 'uploads', 'upgrade-packages.sh')
+VERIFY_SCRIPT = os.path.join(SCRIPT_DIR, 'uploads', 'verify-image.sh')
+FINALIZE_SCRIPT = os.path.join(SCRIPT_DIR, 'uploads', 'finalize-image.sh')
+# 写进镜像的构建信息（客户工单里「我这台是哪一版模板装的」一查便知）
+BUILD_INFO_PATH = '/etc/pve-template-release'
+
 # 镜像缓存目录：默认在脚本目录下的 cloud_img（不随当前工作目录变化），可用 CLOUD_IMG_DIR 指到更大的分区
 CACHE_DIR = os.environ.get('CLOUD_IMG_DIR') or os.path.join(SCRIPT_DIR, 'cloud_img')
 DOWNLOAD_RETRIES = 3
 RETRIABLE_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
+# 单个模板 virt-customize 的墙钟上限（含包升级）；超时杀整组进程、该模板记失败
+CUSTOMIZE_TIMEOUT = 3600
+# 单个上游镜像的下载上限：Content-Length 是对方说了算，坏掉 / 恶意的镜像站不能把根分区写满
+MAX_IMAGE_BYTES = 8 * 1024 ** 3
+
+# 模板名会进 qm --name、缓存文件名、import-from 路径：只许 DNS 名字符
+TEMPLATE_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9.-]{0,40}$')
 
 # 未在 templates.yaml 里声明 default_families 时的默认主流系列
 DEFAULT_FAMILIES = ['ubuntu', 'debian', 'centos', 'alpine']
@@ -98,7 +107,7 @@ FAMILY_LABELS = {
 }
 
 # 模板 VM 默认硬件（可用 --bridge / --memory / --cores 覆盖）
-VM_DEFAULTS = {'bridge': 'vmbr0', 'memory': 512, 'cores': 1}
+VM_DEFAULTS = {'bridge': 'vmbr0', 'memory': 512, 'cores': 1, 'cpu': 'host,flags=+aes'}
 
 # 运行期间在宿主机上生成的临时脚本（换源脚本等），结束时统一删除
 _TEMP_FILES: list = []
@@ -139,7 +148,15 @@ def family_label(family: str) -> str:
 
 
 class DownloadError(RuntimeError):
-    """镜像下载失败时提供简明、可操作的错误信息。"""
+    """镜像下载失败时提供简明、可操作的错误信息。
+
+    kind：not-found（上游删了 / 改名了，要改 templates.yaml）/ tls / network / checksum / space ——
+    sync-templates.py 按它决定退避多久、报给平台的原因。
+    """
+
+    def __init__(self, message: str, kind: str = 'network'):
+        super().__init__(message)
+        self.kind = kind
 
 
 TLS_HINT = (
@@ -151,84 +168,57 @@ TLS_HINT = (
 
 
 def disable_tls_verification():
-    """--insecure：为 urllib 安装不校验证书的 HTTPS opener（urlretrieve/urlopen 共用）。"""
+    """--insecure：为 urllib 安装不校验证书的 HTTPS opener（下载 / HEAD / 目录索引共用）。"""
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     urllib.request.install_opener(
         urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx)))
-    print('Warning: --insecure 已启用，将跳过镜像下载的 TLS 证书校验。')
-
-
-class DownloadProgressBar(tqdm.tqdm):
-    def update_to(self, b=1, bsize=1, tsize=None):
-        if tsize is not None:
-            self.total = tsize
-        self.update(b * bsize - self.n)
+    print('Warning: --insecure 已启用，将跳过镜像下载的 TLS 证书校验。', file=sys.stderr)
 
 
 class StorageInfo:
+    """保留给旧调用方：只记录存储名（磁盘改用 import-from 导入，不再猜 disk-0 卷名）。"""
+
     class Base:
         def __init__(self, name) -> None:
             self.name = name
-        def format_disk_name(self, vmid: int):
-            raise NotImplementedError
 
     class Dir(Base):
-        def format_disk_name(self, vmid: int):
-            # qm importdisk 默认会生成 <vmid>/vm-<vmid>-disk-0.qcow2
-            return f'{vmid}/vm-{vmid}-disk-0.qcow2'
+        pass
 
     class Raw(Base):
-        def format_disk_name(self, vmid: int):
-            # zfspool/lvm/lvmthin 等为块设备名
-            return f'vm-{vmid}-disk-0'
+        pass
 
 
 def run(cmd, **extra_env):
-    """
-    统一外部命令执行：打印命令、继承环境、失败抛异常。
-    cmd 可为 list 或 str（str 时使用 shell=True）
-    """
-    print(f'# {cmd}')
+    """统一外部命令执行：打印命令、继承环境、失败抛异常。cmd 必须是 list（不经 shell）。"""
+    print(f'# {" ".join(str(c) for c in cmd)}')
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
-    subprocess.run(
-        cmd,
-        check=True,
-        env=env,
-        shell=isinstance(cmd, str)
-    )
+    subprocess.run([str(c) for c in cmd], check=True, env=env)
 
 
 def check_storage(name: str) -> StorageInfo.Base:
-    output = subprocess.check_output(['pvesh', 'get', '/storage', '--output-format=json-pretty'])
+    output = subprocess.check_output(['pvesh', 'get', '/storage', '--output-format=json'])
     for st in json.loads(output):
         if st.get('storage') != name:
             continue
         content = st.get('content', '')
         if 'images' not in content.split(','):
-            raise Exception(f'PVE storage {name} does not support VM images.')
+            raise pitlib.PitError(f'PVE storage {name} does not support VM images.')
+        if st.get('disable'):
+            raise pitlib.PitError(f'PVE storage {name} is disabled.')
         t = st.get('type')
-        if t in ['dir', 'nfs', 'glusterfs']:
+        if t in ['dir', 'nfs', 'glusterfs', 'cifs', 'btrfs']:
             return StorageInfo.Dir(name)
-        if t in ['zfspool', 'lvm', 'lvmthin']:
-            return StorageInfo.Raw(name)
-        raise Exception(f'Unsupported PVE storage type {t}.')
-    raise Exception(f'PVE storage {name} does not exist.')
+        return StorageInfo.Raw(name)
+    raise pitlib.PitError(f'PVE storage {name} does not exist.')
 
 
 def vm_exists_by_name(name: str) -> bool:
-    try:
-        out = subprocess.check_output(['qm', 'list'])
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return False
-    for line in out.decode(errors='ignore').splitlines()[1:]:
-        cols = line.split()
-        if len(cols) >= 2 and cols[1] == name:
-            return True
-    return False
+    return name in list_existing_vm_names()
 
 
 def list_existing_vm_names() -> set:
@@ -245,38 +235,20 @@ def list_existing_vm_names() -> set:
 
 
 def cluster_vm_index() -> Tuple[set, set]:
-    """返回 (已用 VMID 集合, 已存在名称集合)。
+    """返回 (已用 VMID 集合 —— 含 LXC, 已存在的 qemu 名称集合)。
 
-    VMID 在 PVE 集群内全局唯一，因此优先用 pvesh 跨节点收集，避免与其他节点的 VM
-    冲突导致 `qm create` 失败；pvesh 不可用时回退到本节点 `qm list`。
+    VMID 在 PVE 集群内全局唯一（qemu / lxc 共用号段），漏掉 LXC 会让 qm create 撞号并连锁失败。
     """
+    vmids = pitlib.cluster_used_vmids()
+    names = set()
     try:
         out = subprocess.check_output(
             ['pvesh', 'get', '/cluster/resources', '--type', 'vm', '--output-format', 'json'])
-        vmids, names = set(), set()
         for r in json.loads(out):
-            if r.get('type') != 'qemu':
-                continue
-            vid = r.get('vmid')
-            if vid is not None:
-                vmids.add(int(vid))
-            nm = r.get('name')
-            if nm:
-                names.add(nm)
-        return vmids, names
+            if r.get('type') == 'qemu' and r.get('name'):
+                names.add(r['name'])
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
-        pass
-    # 回退：仅本节点
-    names = list_existing_vm_names()
-    vmids = set()
-    try:
-        out = subprocess.check_output(['qm', 'list'])
-        for line in out.decode(errors='ignore').splitlines()[1:]:
-            cols = line.split()
-            if cols and cols[0].isdigit():
-                vmids.add(int(cols[0]))
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
+        names = list_existing_vm_names()
     return vmids, names
 
 
@@ -299,6 +271,15 @@ def build_customize_args(customize: Optional[dict]) -> list:
     return args
 
 
+def customize_files(customize: Optional[dict]) -> list:
+    """customize 引用到的宿主机文件（进配方指纹：脚本改了 = 需要重建）。"""
+    if not customize:
+        return []
+    files = [_resolve(up.split(':', 1)[0]) for up in customize.get('uploads', []) if ':' in up]
+    files += [_resolve(s) for s in customize.get('run', [])]
+    return files
+
+
 def _resolve(path: str) -> str:
     """将相对路径基于脚本所在目录解析为规范化的绝对路径。"""
     if not os.path.isabs(path):
@@ -309,7 +290,7 @@ def _resolve(path: str) -> str:
 def build_tuning_args() -> list:
     """返回注入网络/内核调优所需的 virt-customize 参数。"""
     if not os.path.exists(TUNING_SCRIPT):
-        print(f'Warning: tuning script not found at {TUNING_SCRIPT}, skipping net tuning.')
+        print(f'Warning: tuning script not found at {TUNING_SCRIPT}, skipping net tuning.', file=sys.stderr)
         return []
     return ['--run', TUNING_SCRIPT]
 
@@ -317,14 +298,17 @@ def build_tuning_args() -> list:
 def detect_os_family(template_name: str) -> Optional[str]:
     """
     根据模板名称检测操作系统类型。
-    返回：'debian', 'ubuntu', 'rhel', 'arch', 'alpine', 'suse' 或 None
+    返回：'debian', 'ubuntu', 'rhel', 'fedora', 'arch', 'alpine', 'suse' 或 None
     """
     name_lower = template_name.lower()
     if 'ubuntu' in name_lower:
         return 'ubuntu'
     if 'debian' in name_lower:
         return 'debian'
-    if any(x in name_lower for x in ['centos', 'alma', 'rocky', 'rhel', 'fedora']):
+    if 'fedora' in name_lower:
+        # Fedora 的 repo 结构与 RHEL 系不同，换源规则不通用；单列出来，换源时跳过
+        return 'fedora'
+    if any(x in name_lower for x in ['centos', 'alma', 'rocky', 'rhel']):
         return 'rhel'
     if 'arch' in name_lower:
         return 'arch'
@@ -347,7 +331,7 @@ def build_mirror_command(mirror_config: dict, os_family: str) -> Optional[str]:
         return None
 
     os_mirror = mirror_config[os_family]
-    base_url = os_mirror.get('url', '')
+    base_url = os_mirror.get('url', '').rstrip('/')
 
     if not base_url:
         return None
@@ -372,38 +356,27 @@ exit 0
 '''
 
     elif os_family == 'debian':
+        # base_url 本身就带 /debian（如 http://mirrors.aliyun.com/debian）：整段替换 deb.debian.org/debian，
+        # 安全源用同级的 <base>-security。旧版直接替换主机名，拼出 .../debian/debian，换源后 apt 全挂。
         return f'''#!/bin/sh
 set -eu
 # 配置 Debian 镜像源
+for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do
+    [ -f "$f" ] || continue
+    cp "$f" "$f.bak"
+    sed -i -E 's@https?://deb\\.debian\\.org/debian-security@{base_url}-security@g' "$f"
+    sed -i -E 's@https?://security\\.debian\\.org/debian-security@{base_url}-security@g' "$f"
+    sed -i -E 's@https?://deb\\.debian\\.org/debian@{base_url}@g' "$f"
+done
 
-# 方法1: 传统 sources.list 格式 (Debian 10/11)
-if [ -f /etc/apt/sources.list ]; then
-    cp /etc/apt/sources.list /etc/apt/sources.list.bak
-    sed -i -E 's@https?://deb\\.debian\\.org@{base_url}@g' /etc/apt/sources.list
-    sed -i -E 's@https?://security\\.debian\\.org@{base_url}@g' /etc/apt/sources.list
-fi
-
-# 方法2: DEB822 格式 (Debian 12+)
-if [ -f /etc/apt/sources.list.d/debian.sources ]; then
-    cp /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list.d/debian.sources.bak
-    sed -i -E 's@https?://deb\\.debian\\.org@{base_url}@g' /etc/apt/sources.list.d/debian.sources
-    sed -i -E 's@https?://security\\.debian\\.org@{base_url}@g' /etc/apt/sources.list.d/debian.sources
-fi
-
-# 方法3: 镜像重定向列表 (Debian 12/13 cloud image 使用)
-# 这些文件被 sources 中的 mirror+file 引用
+# 镜像重定向列表 (Debian 12/13 cloud image 的 mirror+file 引用)
 if [ -d /etc/apt/mirrors ]; then
     for mirror_file in /etc/apt/mirrors/*.list; do
         [ -f "$mirror_file" ] || continue
         cp "$mirror_file" "$mirror_file.bak"
-        # 直接将内容替换为新的镜像源地址
         case "$mirror_file" in
-            *debian-security.list)
-                echo "{base_url}/debian-security" > "$mirror_file"
-                ;;
-            *debian.list)
-                echo "{base_url}/debian" > "$mirror_file"
-                ;;
+            *debian-security.list) echo "{base_url}-security" > "$mirror_file" ;;
+            *debian.list) echo "{base_url}" > "$mirror_file" ;;
         esac
     done
 fi
@@ -418,13 +391,13 @@ set -eu
 for repo in /etc/yum.repos.d/*.repo; do
     [ -f "$repo" ] || continue
     cp "$repo" "$repo.bak"
-    # 注释掉 mirrorlist，启用 baseurl
-    sed -i 's/^mirrorlist=/#mirrorlist=/g' "$repo"
-    sed -i 's/^#baseurl=/baseurl=/g' "$repo"
-    # 替换 baseurl
+    # 注释掉 mirrorlist / metalink，启用 baseurl（AlmaLinux 写成 "# baseurl" 带空格）
+    sed -i -E 's/^(mirrorlist|metalink)=/#\\1=/' "$repo"
+    sed -i -E 's/^#[[:space:]]*baseurl=/baseurl=/' "$repo"
     sed -i -E 's@https?://mirror\\.centos\\.org@{base_url}@g' "$repo"
     sed -i -E 's@https?://vault\\.centos\\.org@{base_url}@g' "$repo"
     sed -i -E 's@https?://repo\\.almalinux\\.org@{base_url}@g' "$repo"
+    sed -i -E 's@https?://dl\\.rockylinux\\.org@{base_url}@g' "$repo"
     sed -i -E 's@https?://mirror\\.rockylinux\\.org@{base_url}@g' "$repo"
 done
 exit 0
@@ -475,63 +448,92 @@ def build_mirror_args(mirror_config: Optional[dict], template_name: str) -> list
 
     os_family = detect_os_family(template_name)
     if not os_family:
-        print(f'Warning: Cannot detect OS family for {template_name}, skipping mirror configuration.')
+        print(f'Warning: Cannot detect OS family for {template_name}, skipping mirror configuration.', file=sys.stderr)
         return []
 
     mirror_cmd = build_mirror_command(mirror_config, os_family)
     if not mirror_cmd:
-        print(f'Warning: Mirror not configured for OS family "{os_family}", skipping.')
+        print(f'Warning: Mirror not configured for OS family "{os_family}", skipping.', file=sys.stderr)
         return []
 
     # 创建临时脚本文件（宿主机侧；--run 会把它上传到镜像内执行，宿主机文件在结束时由 cleanup_temp_files 删除）
     script_fd, script_path = tempfile.mkstemp(prefix='mirror_setup_', suffix='.sh')
-    try:
-        with os.fdopen(script_fd, 'w') as f:
-            f.write(mirror_cmd)
-        os.chmod(script_path, 0o755)
-        _TEMP_FILES.append(script_path)
-        return ['--run', script_path]
-    except Exception as e:
-        print(f'Warning: Failed to create mirror script: {e}')
-        with contextlib.suppress(Exception):
-            os.close(script_fd)
-            os.remove(script_path)
-        return []
+    _TEMP_FILES.append(script_path)
+    with os.fdopen(script_fd, 'w') as f:
+        f.write(mirror_cmd)
+    os.chmod(script_path, 0o700)
+    return ['--run', script_path]
 
 
 def http_head(url: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    尝试 HEAD，返回 (ETag, Last-Modified)。若不支持/失败则抛出异常由调用方处理。
-    """
-    req = urllib.request.Request(url, method="HEAD")
-    with urllib.request.urlopen(req) as resp:
-        etag = resp.headers.get("ETag")
-        lm = resp.headers.get("Last-Modified")
-        return etag, lm
+    """尝试 HEAD，返回 (ETag, Last-Modified)。若不支持/失败则抛出异常由调用方处理。"""
+    head = pitlib.http_head(url)
+    return head['etag'], head['last_modified']
 
 
 def load_meta(meta_path: str) -> dict:
     try:
         with open(meta_path, "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
+            doc = json.load(f)
+            return doc if isinstance(doc, dict) else {}
+    except (FileNotFoundError, ValueError):
         return {}
 
 
 def save_meta(meta_path: str, data: dict):
-    with open(meta_path, "w") as f:
-        json.dump(data, f)
+    pitlib.write_json_atomic(meta_path, data)
+
+
+def source_unchanged(meta_old: dict, head: dict) -> bool:
+    """缓存是否与上游一致：两边都有 ETag 就只认 ETag（ETag 不同但 Last-Modified 相同 = 变了）；否则比 Last-Modified。"""
+    if head.get('etag') and meta_old.get('etag'):
+        return head['etag'] == meta_old['etag']
+    if head.get('last_modified') and meta_old.get('last_modified'):
+        return head['last_modified'] == meta_old['last_modified']
+    return False
+
+
+def _progress_bar(total: Optional[int]):
+    if tqdm is not None and sys.stderr.isatty():
+        return tqdm.tqdm(total=total, unit='B', unit_scale=True, miniters=1)
+    return None
 
 
 def download_file(name: str, url: str, destination: str):
-    """下载镜像；仅对临时网络和服务端错误进行有限重试。"""
+    """下载镜像（带连接/读超时）；仅对临时网络和服务端错误进行有限重试。"""
     for attempt in range(1, DOWNLOAD_RETRIES + 1):
         with contextlib.suppress(FileNotFoundError):
             os.remove(destination)
         try:
-            with DownloadProgressBar(unit="B", unit_scale=True, miniters=1) as t:
-                urllib.request.urlretrieve(url, destination, reporthook=t.update_to)
+            with pitlib.http_open(url) as resp, open(destination, 'wb') as out:
+                if url.startswith('https://') and not str(resp.geturl()).startswith('https://'):
+                    # 镜像分发器（Fedora mirrormanager 等）把 https 重定向到明文 http：完整性只剩同源的校验文件，拒绝
+                    raise DownloadError(f'{name}: redirected from https to {resp.geturl()}; refusing a plaintext download', 'tls')
+                total = resp.headers.get('Content-Length')
+                total = int(total) if total and total.isdigit() else None
+                bar = _progress_bar(total)
+                done, next_log = 0, 0.1
+                if total is not None and total > MAX_IMAGE_BYTES:
+                    raise DownloadError(f'{name}: upstream image is {total >> 20} MiB, over the {MAX_IMAGE_BYTES >> 20} MiB limit', 'space')
+                for chunk in iter(lambda: resp.read(1 << 20), b''):
+                    out.write(chunk)
+                    done += len(chunk)
+                    if done > MAX_IMAGE_BYTES:
+                        raise DownloadError(f'{name}: download exceeded {MAX_IMAGE_BYTES >> 20} MiB; aborted', 'space')
+                    if bar is not None:
+                        bar.update(len(chunk))
+                    elif total and done / total >= next_log:
+                        print(f'  {name}: {int(done * 100 / total)}% of {total >> 20} MiB', file=sys.stderr)
+                        next_log += 0.1
+                if bar is not None:
+                    bar.close()
+                if total is not None and done != total:
+                    raise ConnectionError(f'short read ({done} of {total} bytes)')
             return
+        except DownloadError:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(destination)
+            raise
         except urllib.error.HTTPError as exc:
             retriable = exc.code in RETRIABLE_HTTP_STATUSES
             detail = f'HTTP {exc.code} {exc.reason}'
@@ -546,11 +548,17 @@ def download_file(name: str, url: str, destination: str):
             tls_error = (isinstance(exc.reason, ssl.SSLCertVerificationError)
                          or 'CERTIFICATE_VERIFY_FAILED' in detail)
             retriable = not tls_error
+        except (OSError, ConnectionError) as exc:
+            # 读超时 / 连接被重置 / IncompleteRead：都按临时故障重试
+            detail = f'{type(exc).__name__}: {exc}'
+            final_url = url
+            not_found = tls_error = False
+            retriable = True
 
         if retriable and attempt < DOWNLOAD_RETRIES:
-            delay = 2 ** (attempt - 1)
+            delay = 2 ** attempt
             print(f'Download failed ({detail}); retrying in {delay}s '
-                  f'({attempt}/{DOWNLOAD_RETRIES - 1})...')
+                  f'({attempt}/{DOWNLOAD_RETRIES - 1})...', file=sys.stderr)
             time.sleep(delay)
             continue
 
@@ -558,81 +566,184 @@ def download_file(name: str, url: str, destination: str):
             os.remove(destination)
         if not_found:
             hint = 'The configured image URL no longer exists; update templates.yaml with a current URL.'
+            kind = 'not-found'
         elif tls_error:
             hint = TLS_HINT
+            kind = 'tls'
         else:
             hint = 'Check the URL and the host network/proxy configuration.'
+            kind = 'network'
         raise DownloadError(
             f'Failed to download template "{name}": {detail}\n'
-            f'URL: {final_url}\n{hint}'
+            f'URL: {final_url}\n{hint}', kind
         ) from None
 
 
-def download_with_cache(name: str, url: str, unpack_cmd: Optional[str] = None, refresh: bool = False) -> str:
+def download_any(name: str, urls: list, destination: str) -> str:
+    """按顺序试主站与 image_mirrors 备用地址，返回实际下载成功的地址；全部失败抛最后一个（404 优先报）。"""
+    errors = []
+    for url in urls:
+        try:
+            download_file(name, url, destination)
+            if url != urls[0]:
+                print(f'Downloaded {name} from mirror {url}', file=sys.stderr)
+            return url
+        except DownloadError as e:
+            errors.append(e)
+            if len(urls) > 1:
+                print(f'Warning: {url} failed ({str(e).splitlines()[0]}); trying the next mirror', file=sys.stderr)
+    gone = [e for e in errors if e.kind == 'not-found']
+    raise (gone[0] if gone and len(gone) == len(errors) else errors[-1])
+
+
+def verify_download(template: dict, url: str, path: str, config: Optional[dict] = None) -> dict:
+    """按模板 checksum 配置核对下载文件；不一致抛 DownloadError，取不到校验文件只告警（记 verified=false）。
+
+    校验文件先从主站取，主站不通再按 image_mirrors 改写去备用站取（与镜像本体同一套规则）。
     """
-    下载镜像（支持缓存比较），必要时解包成 {img}。
-    - name: 模板名（用于生成本地文件名）
-    - url: 远端镜像/压缩包地址
-    - unpack_cmd: 例如 'unzip -p {dl} > {img}' 或 'xz -dc {dl} > {img}'
-                  可使用占位符 {dl}（下载文件）、{img}（目标镜像）
-    - refresh: True 时忽略缓存、强制重下
-    返回：img 路径
+    filename = url.rsplit('/', 1)[-1]
+    try:
+        ck_url = pitlib.checksum_url(template, url)
+    except (OSError, urllib.error.URLError, pitlib.PitError) as e:
+        ck_url, last_error = None, e
+    else:
+        last_error = None
+    if not ck_url:
+        if last_error is None and not (template.get('checksum') or template.get('checksum_pattern')):
+            return {'verified': False, 'reason': 'no checksum configured'}
+        print(f'Warning: checksum for {template["name"]} unavailable ({last_error}); continuing unverified', file=sys.stderr)
+        return {'verified': False, 'reason': f'checksum unavailable: {last_error}'[:200]}
+    parsed = None
+    for candidate in pitlib.mirror_candidates(ck_url, config):
+        try:
+            parsed = pitlib.parse_checksum(pitlib.http_text(candidate, pitlib.CHECKSUM_MAX_BYTES), filename)
+            break
+        except (OSError, urllib.error.URLError, pitlib.PitError) as e:
+            last_error = e
+    if parsed is None and last_error is not None:
+        print(f'Warning: checksum for {template["name"]} unavailable ({last_error}); continuing unverified', file=sys.stderr)
+        return {'verified': False, 'reason': f'checksum unavailable: {last_error}'[:200]}
+    if not parsed or not parsed[0]:
+        print(f'Warning: {ck_url} has no entry for {filename}; continuing unverified', file=sys.stderr)
+        return {'verified': False, 'reason': 'no entry for file'}
+    algo, expected = parsed
+    got = pitlib.file_digest(path, algo)
+    if got != expected:
+        raise DownloadError(f'Checksum mismatch for {template["name"]}: {algo} {got} ≠ {expected} ({ck_url})',
+                            'checksum')
+    return {'verified': True, 'algo': algo, 'hex': expected}
+
+
+def upstream_checksum(template: dict, url: str, config: Optional[dict] = None) -> Optional[str]:
+    """上游校验文件里这个镜像当前的 hash（取不到返回 None）。sync 用它判断「上游换了没有」：比 ETag 可靠——
+    Fedora / openSUSE / Arch 的 HEAD 会被重定向到不同镜像站，ETag 每次都不一样。"""
+    filename = url.rsplit('/', 1)[-1]
+    try:
+        ck_url = pitlib.checksum_url(template, url)
+    except (OSError, urllib.error.URLError, pitlib.PitError):
+        return None
+    if not ck_url:
+        return None
+    for candidate in pitlib.mirror_candidates(ck_url, config):
+        try:
+            parsed = pitlib.parse_checksum(pitlib.http_text(candidate, pitlib.CHECKSUM_MAX_BYTES), filename)
+        except (OSError, urllib.error.URLError, pitlib.PitError):
+            continue
+        return parsed[1] if parsed and parsed[0] else None
+    return None
+
+
+def fetch_image(template: dict, refresh: bool = False, config: Optional[dict] = None,
+                url: Optional[str] = None, expected_checksum: Optional[str] = None,
+                require_checksum: bool = False) -> Tuple[str, dict]:
+    """下载（或复用缓存）上游镜像，返回 (img 路径, 来源元数据)。缓存镜像永远是上游原样，不在上面做定制。
+
+    url：调用方已经定好的下载地址（sync 的决策用的那个）；不传才自己解析——两次解析之间索引可能变了。
     """
+    name = template['name']
+    if config is None:
+        config = load_config()
     os.makedirs(CACHE_DIR, exist_ok=True)
     img = os.path.join(CACHE_DIR, f'{name}.img')
-    dl  = os.path.join(CACHE_DIR, f'{name}.img.download')
-    meta = os.path.join(CACHE_DIR, f'{name}.meta.json')
+    dl = os.path.join(CACHE_DIR, f'{name}.img.download')
+    meta_path = os.path.join(CACHE_DIR, f'{name}.meta.json')
+    meta_old = load_meta(meta_path)
+    if url is None:
+        url = pitlib.resolve_source_url(template, log=lambda m: print(m, file=sys.stderr), config=config,
+                                        last_known=meta_old.get('url'))
 
-    if not refresh and os.path.exists(img):
-        # 试图用 HEAD 比对
-        try:
-            etag_new, lm_new = http_head(url)
-            meta_old = load_meta(meta)
-            if etag_new and meta_old.get("etag") == etag_new:
-                print(f'Image for {name} unchanged (ETag), skip download.')
-                return img
-            if lm_new and meta_old.get("last_modified") == lm_new:
-                print(f'Image for {name} unchanged (Last-Modified), skip download.')
-                return img
-        except Exception as e:
-            print(f'HEAD check failed: {e}, will download.')
+    head = {}
+    try:
+        head = pitlib.http_head(url)
+    except Exception as e:  # noqa: BLE001 - HEAD 只是优化，失败照常下载
+        print(f'HEAD {url} failed: {e}', file=sys.stderr)
 
-    # 开始下载
-    download_file(name, url, dl)
+    # 旧版缓存（没有 url / sha256 字段）被就地定制过，不能复用；sync 已从上游校验文件拿到期望 hash 时，缓存对不上也不能复用
+    # （HEAD 失败 / CDN 的 ETag 过期时会拿旧缓存构建，下一轮又判「上游变了」，循环重建）
+    cached_hex = (meta_old.get('checksum') or {}).get('hex')
+    reusable = (not refresh and os.path.exists(img) and meta_old.get('url') == url and meta_old.get('sha256')
+                and (expected_checksum is None or cached_hex == expected_checksum))
+    if reusable and (source_unchanged(meta_old, head) or not head):
+        why = 'unchanged' if head else 'upstream unreachable, using cache'
+        print(f'Image for {name} {why}, skip download.', file=sys.stderr)
+        return img, meta_old
 
-    # 如果需要解包
-    if unpack_cmd:
-        # 确保旧 img 不干扰
+    # 下载 + 解包最多同时占两份；没有 Content-Length 时按 4 GiB 估
+    length = int(head['length']) if str(head.get('length') or '').isdigit() else 2 * pitlib.GIB
+    try:
+        pitlib.ensure_space(f'cache dir {CACHE_DIR}', pitlib.free_bytes(CACHE_DIR), 2 * length + pitlib.GIB // 2)
+    except pitlib.PitError as e:
+        raise DownloadError(str(e), 'space') from None
+
+    fetched_from = download_any(name, pitlib.mirror_candidates(url, config), dl)
+    checksum = verify_download(template, url, dl, config)
+    if require_checksum and not checksum.get('verified') and (template.get('checksum') or template.get('checksum_pattern')):
+        # 无人值守构建（sync）：配了校验却核对不了就不建——产物会发给每一台新客户 VM
         with contextlib.suppress(FileNotFoundError):
-            os.remove(img)
-        cmd = unpack_cmd.replace('{dl}', dl).replace('{img}', img)
-        run(cmd)
+            os.remove(dl)
+        raise DownloadError(f'{name}: checksum configured but could not be verified ({checksum.get("reason")}); not building', 'checksum')
+
+    unpack = template.get('unpack')
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(img)
+    if unpack:
+        # yaml 里的 unpack 是仓库作者写的固定命令模板；占位符只会是缓存路径（不含空格 / 引号）
+        cmd = unpack.replace('{dl}', dl).replace('{img}', img)
+        print(f'# {cmd}', file=sys.stderr)
+        subprocess.run(cmd, shell=True, check=True)
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(dl)
     else:
-        # 直接移动为 img
-        with contextlib.suppress(FileNotFoundError):
-            os.remove(img)
         os.replace(dl, img)
 
-    # 更新元信息
-    try:
-        etag, lm = http_head(url)
-        save_meta(meta, {"etag": etag, "last_modified": lm})
-    except Exception as e:
-        print(f'HEAD after download failed: {e}')
+    meta = {
+        'url': url,
+        'fetched_from': fetched_from,
+        'etag': head.get('etag'),
+        'last_modified': head.get('last_modified'),
+        'sha256': pitlib.file_digest(img, 'sha256'),
+        'checksum': checksum,
+        'fetched_at': int(time.time()),
+    }
+    save_meta(meta_path, meta)
+    return img, meta
 
-    # 清理下载缓存文件（如果还在）
-    with contextlib.suppress(FileNotFoundError):
-        os.remove(dl)
 
+def download_with_cache(name: str, url: str, unpack_cmd: Optional[str] = None, refresh: bool = False) -> str:
+    """兼容旧调用方：返回缓存的上游镜像路径。"""
+    img, _meta = fetch_image({'name': name, 'url': url, 'unpack': unpack_cmd}, refresh)
     return img
 
 
 def match_templates(all_tpls: list, filter_expr: Optional[str], families: Optional[list] = None) -> list:
-    """支持逗号分隔 / 通配 / 系列名的模板选择。
+    """支持逗号分隔 / 通配 / 系列名的模板选择（模板名大小写不敏感）。
 
     - filter_expr 为空时：families 为 None 返回全部，否则只返回属于这些系列的模板。
     - 每个选择项依次尝试：精确名称 → glob 通配 → 系列名（如 rocky / alpine）。
+    - @profile 展开成 templates.yaml profiles 里的列表（如 @minimal：小硬盘节点只要几个主流模板）。
     """
+    if filter_expr and '@' in filter_expr:
+        filter_expr = pitlib.expand_profiles(filter_expr, load_config())
     if not filter_expr:
         if families is None:
             return list(all_tpls)
@@ -642,9 +753,9 @@ def match_templates(all_tpls: list, filter_expr: Optional[str], families: Option
     matched = []
     for n in names:
         if any(ch in n for ch in "*?[]"):
-            matched.extend([t for t in all_tpls if fnmatch.fnmatch(t["name"], n)])
+            matched.extend([t for t in all_tpls if fnmatch.fnmatch(t["name"].lower(), n.lower())])
             continue
-        exact = [t for t in all_tpls if t["name"] == n]
+        exact = [t for t in all_tpls if t["name"].lower() == n.lower()]
         if exact:
             matched.extend(exact)
             continue
@@ -652,7 +763,7 @@ def match_templates(all_tpls: list, filter_expr: Optional[str], families: Option
         if by_family:
             matched.extend(by_family)
         else:
-            print(f'Warning: no template matches "{n}".')
+            print(f'Warning: no template matches "{n}".', file=sys.stderr)
     # 去重保持顺序
     seen = set()
     uniq = []
@@ -665,86 +776,275 @@ def match_templates(all_tpls: list, filter_expr: Optional[str], families: Option
 
 def destroy_vm_quietly(vmid: int):
     """导入中途失败时清理半成品 VM（尽力而为，不抛异常）。"""
-    print(f'清理未完成的 VM {vmid} ...')
-    subprocess.run(['qm', 'destroy', str(vmid), '--purge', '--destroy-unreferenced-disks', '1'],
+    print(f'清理未完成的 VM {vmid} ...', file=sys.stderr)
+    # 不带 --destroy-unreferenced-disks：它按 VMID 扫存储上的卷，没组集群却共挂存储的节点会误删别的机器同号 VM 的盘
+    subprocess.run(['qm', 'destroy', str(vmid), '--purge', '1'],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
 
-def import_template(template: dict, storage: StorageInfo.Base, vmid: int, keep_image: bool = True,
-                    refresh: bool = False, mirror_config: Optional[dict] = None, apply_tuning: bool = True,
-                    vm_opts: Optional[dict] = None) -> str:
-    """导入单个模板；返回 'ok' 或 'skipped'，失败抛异常（半成品 VM 会被清理）。"""
+def upgrade_enabled(template: dict, upgrade: bool) -> bool:
+    return upgrade and template.get('upgrade', True) is not False
+
+
+def tuning_enabled(template: dict, apply_tuning: bool) -> bool:
+    return apply_tuning and template.get('net_tuning', True) is not False
+
+
+def recipe_of(template: dict, apply_tuning: bool, upgrade: bool, mirror_name: Optional[str]) -> str:
+    """配方指纹：yaml 条目 + 引用到的脚本内容 + 工具版本 + 开关。sync 据此判断「注入方式变了要重建」。"""
+    files = customize_files(template.get('customize')) + [VERIFY_SCRIPT, FINALIZE_SCRIPT]
+    if upgrade_enabled(template, upgrade):
+        files.append(UPGRADE_SCRIPT)
+    if tuning_enabled(template, apply_tuning):
+        files.append(TUNING_SCRIPT)
+    tpl = dict(template)
+    tpl['_switches'] = {'tuning': tuning_enabled(template, apply_tuning),
+                        'upgrade': upgrade_enabled(template, upgrade), 'mirror': mirror_name or ''}
+    tpl.pop('url', None)       # 地址变化由 source 比对负责（discover 会让 url 每个点版本都变）
+    tpl.pop('discover', None)
+    return pitlib.recipe_hash(tpl, files, RECIPE_VERSION)
+
+
+def customization_args(template: dict, mirror_config: Optional[dict], apply_tuning: bool, upgrade: bool,
+                       build_info: str) -> list:
+    """virt-customize 参数，顺序有讲究：
+
+    换源 → 包升级（先拿到安全更新，后面的安装走同一份源）→ 模板 customize（ssh / root / qga）→ 网络调优
+    → 写构建信息 → verify（qga / sshd 生效配置，不达标整个构建失败，旧模板保持在役）→ finalize（清 host key /
+    machine-id / cloud-init 状态 / 日志 / 缓存，必须最后）。
+    """
     name = template['name']
-    url  = template['url']
-    opts = dict(VM_DEFAULTS)
-    if vm_opts:
-        opts.update(vm_opts)
+    args = build_mirror_args(mirror_config, name)
+    if upgrade_enabled(template, upgrade):
+        args += ['--run', UPGRADE_SCRIPT]
+    args += build_customize_args(template.get('customize'))
+    if tuning_enabled(template, apply_tuning):
+        args += build_tuning_args()
+    args += ['--upload', f'{build_info}:{BUILD_INFO_PATH}', '--chmod', f'0644:{BUILD_INFO_PATH}']
+    args += ['--run', VERIFY_SCRIPT, '--run', FINALIZE_SCRIPT]
+    if detect_os_family(name) in ('rhel', 'fedora', 'suse'):
+        args += ['--selinux-relabel']
+    return args
 
-    if vm_exists_by_name(name):
-        print(f'VM with name "{name}" exists, skipping.')
-        return 'skipped'
 
-    print(f'Importing VMID {vmid} ({name}) from {url}')
+def write_build_info(name: str, built_at: int, source: dict) -> str:
+    fd, path = tempfile.mkstemp(prefix='pit_build_info_', suffix='.txt')
+    _TEMP_FILES.append(path)
+    with os.fdopen(fd, 'w') as fh:
+        fh.write(f'TEMPLATE={name}\n')
+        fh.write('BUILT_AT=%s\n' % time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(built_at)))
+        fh.write(f'SOURCE_URL={source.get("url", "")}\n')
+        fh.write(f'SOURCE_SHA256={source.get("sha256", "")}\n')
+        fh.write(f'BUILDER=pve-import-template {TOOL_VERSION}\n')
+    return path
 
-    unpack = template.get('unpack')  # 例如：'unzip -p {dl} > {img}'
-    img = download_with_cache(name, url, unpack_cmd=unpack, refresh=refresh)
 
-    # 构建 virt-customize 参数：先配置镜像源，再执行其他自定义命令，最后注入调优
-    mirror_args = build_mirror_args(mirror_config, name)
-    cust_args = build_customize_args(template.get('customize'))
-    # 网络/内核调优默认开启；模板可用 net_tuning: false 单独关闭，全局可用 --no-tuning 关闭
-    tuning_on = apply_tuning and template.get('net_tuning', True)
-    tuning_args = build_tuning_args() if tuning_on else []
-    all_cust_args = mirror_args + cust_args + tuning_args
+def smoke_test(template_vmid: int, allocate, timeout: int, log, memory: int = 512) -> None:
+    """切换前的开机闸：从新模板克隆一台临时 VM（拔掉所有网卡、摘掉 hookscript），开机后 timeout 秒内 qemu-guest-agent
+    必须应答，然后销毁。包升级会在 chroot 里动内核 / initramfs / grub / extlinux；verify-image.sh 只能看文件，看不出「还能不能开机」。
 
-    if all_cust_args:
-        # 使用 direct 后端，避免某些宿主限制导致失败；
-        # 若 KVM 不可用（如 PVE 本身是嵌套虚拟机）导致 guestfs_launch 失败，自动回退软件模拟重试。
-        try:
-            run(['virt-customize', '-a', img, *all_cust_args], LIBGUESTFS_BACKEND='direct')
-        except subprocess.CalledProcessError:
-            print('virt-customize 失败，回退到软件模拟（force_tcg）重试 ...')
-            run(['virt-customize', '-a', img, *all_cust_args],
-                LIBGUESTFS_BACKEND='direct', LIBGUESTFS_BACKEND_SETTINGS='force_tcg')
-        finally:
-            cleanup_temp_files()
-
-    # 创建 VM 并导入磁盘；任一步失败（含 Ctrl-C）都清理掉半成品 VM，避免留下无盘/无模板标记的残留
+    allocate：每次调用给一个临时号（从区间顶端往下取，不推高模板的游标）。
+    """
+    tmp = None
     created = False
     try:
-        run(['qm', 'create', str(vmid), '--name', name,
-             '--memory', str(opts['memory']), '--cores', str(opts['cores']),
-             '--net0', f'virtio,bridge={opts["bridge"]},queues=4',
-             '--cpu', 'host,flags=+aes', '--ostype', 'l26',
-             '--agent', 'enabled=1,fstrim_cloned_disks=1'])
+        for attempt in range(3):
+            tmp = allocate()
+            try:
+                pitlib.run_cmd(['qm', 'clone', template_vmid, tmp, '--name', f'pitsmoke-{template_vmid}', '--full', '0'],
+                               timeout=600, log=log)
+            except pitlib.CommandError as e:
+                if 'already exists' in e.output and attempt < 2:
+                    continue  # 集群里别的节点刚占了这个号
+                if 'linked clone' not in e.output.lower():
+                    raise
+                # 只有「存储不支持链接克隆」（厚置备 LVM 等）才退回全克隆；锁超时之类的错误不该变成一次整盘拷贝
+                pitlib.run_cmd(['qm', 'clone', template_vmid, tmp, '--name', f'pitsmoke-{template_vmid}', '--full', '1'],
+                               timeout=1800, log=log)
+            created = True
+            break
+        cfg = pitlib.vm_config(pitlib.local_node_name() or '', tmp)
+        drop = [k for k in cfg if re.fullmatch(r'net\d+', k)] + (['hookscript'] if cfg.get('hookscript') else [])
+        args = ['qm', 'set', tmp, '--tags', pitlib.TAG_SMOKE, '--onboot', '0', '--memory', max(int(memory), 1024)]
+        if drop:
+            # 不接网（不会 DHCP、不碰客户网络）；不跑 hook（hook 会注入路由 / 上报事件）
+            args += ['--delete', ','.join(drop)]
+        pitlib.run_cmd(args, timeout=120, log=log)
+        pitlib.run_cmd(['qm', 'start', tmp], timeout=180, log=log)
+        deadline = time.time() + timeout
+        while True:
+            try:
+                pitlib.run_cmd(['qm', 'guest', 'cmd', tmp, 'ping'], timeout=20)
+                log(f'smoke test: VM {tmp} booted and the guest agent answered')
+                return
+            except pitlib.CommandError:
+                if time.time() >= deadline:
+                    raise pitlib.PitError(f'smoke test failed: a VM cloned from the new template did not answer the guest agent '
+                                          f'within {timeout}s (bootloader / kernel broken by the upgrade?)') from None
+                time.sleep(10)
+    finally:
+        if created and tmp is not None:
+            subprocess.run(['qm', 'stop', str(tmp), '--skiplock', '1', '--timeout', '30'],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            subprocess.run(['qm', 'destroy', str(tmp), '--purge', '1', '--skiplock', '1'],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def build_template(template: dict, storage_name: str, vmid, *, vm_name: str,
+                   mirror_config: Optional[dict] = None, mirror_name: Optional[str] = None,
+                   apply_tuning: bool = True, upgrade: bool = True, refresh: bool = False,
+                   vm_opts: Optional[dict] = None, force_tcg: bool = False, keep_cache: bool = True,
+                   node: Optional[str] = None, log=None, source_url: Optional[str] = None,
+                   smoke_timeout: Optional[int] = None, smoke_allocate=None, extra_config: Optional[dict] = None,
+                   disk_format: Optional[str] = None, expected_checksum: Optional[str] = None,
+                   require_checksum: bool = False) -> dict:
+    """下载 → 在副本上定制 → 建 VM（import-from）→ qm template →（可选）开机冒烟。返回写进模板的元数据（含 vmid）。
+
+    vmid：整数，或无参可调用对象（每次调用重新分配一个号）——传可调用对象时 VMID 在 qm create 前一刻才分配，
+    撞上 already exists（集群里别的节点同时在建）换号重试。
+    任何一步失败都清理半成品 VM 与副本并抛异常；成功返回后模板已是 template=1，名字是 vm_name。
+    keep_cache=False：结束后（成功或失败）删掉缓存的上游镜像，只留元数据——小硬盘节点不常驻十几 GB 缓存。
+    smoke_timeout：秒；None = 不做开机冒烟。smoke_allocate：冒烟临时 VM 的号（默认同 vmid 分配器）。
+    extra_config：沿用旧模板的节点策略键（hookscript / vga / machine，见 pitlib.CARRY_OVER_KEYS）。
+    disk_format：系统盘格式（文件类存储传 qcow2；None = 存储默认）。
+    expected_checksum / require_checksum：见 fetch_image。
+    """
+    log = log or (lambda m: print(m, file=sys.stderr))
+    name = template['name']
+    if not TEMPLATE_NAME_RE.match(name):
+        raise pitlib.PitError(f'template name {name!r} is not a valid VM name')
+    opts = dict(VM_DEFAULTS)
+    opts.update(vm_opts or {})
+    img_cache = os.path.join(CACHE_DIR, f'{name}.img')
+
+    fixed_vmid = vmid
+    allocate = vmid if callable(vmid) else (lambda: fixed_vmid)  # 不能直接 lambda: vmid——下面会把 vmid 置 None
+    extra = pitlib.carry_over(extra_config or {})
+    created = False
+    work = None
+    vmid = None
+    try:
+        img, source = fetch_image(template, refresh, url=source_url, expected_checksum=expected_checksum,
+                                  require_checksum=require_checksum)
+        fmt = pitlib.inspect_image(img)
+        virtual, actual = pitlib.image_sizes(img)
+        built_at = int(time.time())
+        work_dir = os.path.join(CACHE_DIR, 'work')
+        os.makedirs(work_dir, exist_ok=True)
+        work = os.path.join(work_dir, f'{name}.{os.getpid()}.img')
+        # 副本 + 包升级的增量；目标存储按虚拟大小估（厚置备 LVM 会整块分配，精简置备只会更少）
+        pitlib.ensure_space(f'cache dir {CACHE_DIR}', pitlib.free_bytes(work_dir), actual + pitlib.GIB)
+        pitlib.ensure_space(f'storage {storage_name}',
+                            pitlib.storage_avail(node or pitlib.local_node_name() or '', storage_name),
+                            virtual + pitlib.GIB // 2)
+
+        meta = {
+            'v': pitlib.META_VERSION,
+            'name': name,
+            'tool': TOOL_VERSION,
+            'built_at': built_at,
+            'source': {**{k: source.get(k) for k in ('url', 'etag', 'last_modified', 'sha256')},
+                       'checksum': (source.get('checksum') or {}).get('hex')},
+            'checksum_verified': bool((source.get('checksum') or {}).get('verified')),
+            'upgraded': upgrade_enabled(template, upgrade),
+            'tuning': tuning_enabled(template, apply_tuning),
+            'recipe': recipe_of(template, apply_tuning, upgrade, mirror_name),
+        }
+
+        info = write_build_info(name, built_at, source)
+        pitlib.run_virt_customize(work, customization_args(template, mirror_config, apply_tuning, upgrade, info),
+                                  timeout=CUSTOMIZE_TIMEOUT, force_tcg=force_tcg, log=log, fmt=fmt,
+                                  prepare=lambda: shutil.copyfile(img, work))
+
+        tags = pitlib.format_tags(pitlib.managed_tags(built_at))
+        # 定制写的是来宾磁盘本身：raw 镜像的第 0 扇区被改写成带 backing 的 qcow2 头，扁平化导入时就会把宿主机文件带进模板
+        if pitlib.inspect_image(work) != fmt:
+            raise pitlib.PitError('customized image changed format; refusing to import it')
+        extra_args = [x for key, value in sorted(extra.items()) for x in ('--' + key, value)]
+        for attempt in range(5):
+            vmid = allocate()
+            try:
+                pitlib.run_cmd(['qm', 'create', vmid, '--name', vm_name,
+                                '--memory', opts['memory'], '--cores', opts['cores'],
+                                '--net0', f'virtio,bridge={opts["bridge"]},queues=4',
+                                '--cpu', opts['cpu'], '--ostype', 'l26',
+                                '--agent', 'enabled=1,fstrim_cloned_disks=1',
+                                '--description', pitlib.encode_description(meta),
+                                '--tags', tags, *extra_args], timeout=300, log=log)
+                break
+            except pitlib.CommandError as e:
+                # 构建要跑很久：期间集群里别的节点可能占了这个号。别人的 VM 绝不碰（created 还是 False），换号再来
+                if 'already exists' not in e.output or attempt == 4:
+                    raise
+                log(f'VMID {vmid} was taken while building; trying another')
         created = True
-        run(f'qm importdisk {vmid} {img} {storage.name} --format qcow2')
-
-        disk = storage.format_disk_name(vmid)
-        run(f'qm set {vmid} --scsihw virtio-scsi-single --scsi0 {storage.name}:{disk},discard=on')
-        run(f'qm set {vmid} --boot c --bootdisk scsi0')
-        run(f'qm set {vmid} --serial0 socket')
-
+        meta['vmid'] = vmid
+        meta['carried'] = sorted(extra)
+        # import-from 一步导入并挂载，不再猜卷名（旧版写死 disk-0，存储上有残留盘时会挂错盘）
+        fmt_opt = f',format={disk_format}' if disk_format else ''
+        pitlib.run_cmd(['qm', 'set', vmid, '--scsihw', 'virtio-scsi-single',
+                        '--scsi0', f'{storage_name}:0,import-from={work},discard=on{fmt_opt}'], timeout=1800, log=log)
+        pitlib.run_cmd(['qm', 'set', vmid, '--boot', 'order=scsi0', '--serial0', 'socket'], timeout=300, log=log)
         if template.get('cloud_init'):
-            run(f'qm set {vmid} --ide2 {storage.name}:cloudinit')
-            # 如需默认 root 用户，可在模板里 cloud-init 配置上传 ssh.cfg
-            run(f'qm set {vmid} --ciuser root')
-            # 默认用 DHCP 获取 IPv4，避免克隆后无网络（可在克隆后再覆盖）
-            run(f'qm set {vmid} --ipconfig0 ip=dhcp')
-
-        run(f'qm template {vmid}')
+            pitlib.run_cmd(['qm', 'set', vmid, '--ide2', f'{storage_name}:cloudinit',
+                            '--ciuser', 'root', '--ipconfig0', 'ip=dhcp'], timeout=300, log=log)
+        pitlib.run_cmd(['qm', 'template', vmid], timeout=600, log=log)
+        if smoke_timeout:
+            smoke_test(vmid, smoke_allocate or allocate, smoke_timeout, log, memory=int(opts['memory']))
     except BaseException:
         if created:
             destroy_vm_quietly(vmid)
         raise
+    finally:
+        if work:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(work)
+        if not keep_cache:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(img_cache)
+        cleanup_temp_files()
+    return meta
+
+
+def import_template(template: dict, storage: StorageInfo.Base, vmid: int, keep_image: bool = True,
+                    refresh: bool = False, mirror_config: Optional[dict] = None, apply_tuning: bool = True,
+                    vm_opts: Optional[dict] = None, mirror_name: Optional[str] = None,
+                    upgrade: bool = True) -> str:
+    """导入单个模板；返回 'ok' 或 'skipped'，失败抛异常（半成品 VM 会被清理）。"""
+    name = template['name']
+    if vm_exists_by_name(name):
+        print(f'VM with name "{name}" exists, skipping (use sync-templates.py to rebuild it).')
+        return 'skipped'
+
+    print(f'Importing VMID {vmid} ({name})')
+    build_template(template, storage.name, vmid, vm_name=name, mirror_config=mirror_config,
+                   mirror_name=mirror_name, apply_tuning=apply_tuning, upgrade=upgrade, refresh=refresh,
+                   vm_opts=vm_opts, log=print, disk_format='qcow2' if isinstance(storage, StorageInfo.Dir) else None,
+                   extra_config=node_template_defaults())
 
     if not keep_image:
+        img = os.path.join(CACHE_DIR, f'{name}.img')
         print(f'Deleting {img}')
         with contextlib.suppress(FileNotFoundError):
             os.remove(img)
 
     print('Done\n')
     return 'ok'
+
+
+def node_template_defaults() -> dict:
+    """新导入的模板沿用本节点已有模板最常见的 hookscript（deploy-hook.sh --attach 9000-9999 挂在模板上，客户 VM 克隆继承）。"""
+    node = pitlib.local_node_name()
+    if not node:
+        return {}
+    counts = {}
+    with contextlib.suppress(pitlib.PitError, ValueError):
+        for vm in pitlib.node_vms(node):
+            if vm['template'] and 9001 <= vm['vmid'] <= 9999:
+                hook = pitlib.carry_over(pitlib.vm_config(node, vm['vmid'])).get('hookscript')
+                if hook:
+                    counts[hook] = counts.get(hook, 0) + 1
+    return {'hookscript': max(counts, key=counts.get)} if counts else {}
 
 
 def print_summary(results: dict):
@@ -765,13 +1065,15 @@ USAGE = '''Usage: python3 import.py <storage-name> <start-vmid> [template-name[,
 
 不指定模板时，默认只导入「主流系列」（templates.yaml 中 default_families，
 默认为 ubuntu/debian/centos/alpine）；--all 导入全部。选择器可写模板名、glob 通配或系列名。
+已存在的模板要换成新构建，请用 sync-templates.py。
 
 Options:
   --all               导入 templates.yaml 中的全部模板（忽略 default_families）
-  --only-new          只导入 PVE 中尚不存在的模板
+  --only-new          只导入本节点尚不存在的模板
   --refresh           忽略缓存，强制重新下载镜像
   --mirror <name>     使用 templates.yaml 中配置的镜像源（内网环境）
   --no-tuning         本次导入不注入网络/内核 sysctl 调优（默认开启）
+  --no-upgrade        不在镜像内执行包升级（默认升级到最新安全补丁）
   --insecure          下载镜像时跳过 TLS 证书校验（仅用于临时绕过证书问题）
   --bridge <name>     模板网卡所接网桥（默认 vmbr0）
   --memory <MB>       模板内存大小（默认 512）
@@ -782,23 +1084,35 @@ Options:
   -h, --help          显示本帮助
 
 Examples:
-  python3 import.py local-lvm 900
-  python3 import.py local-lvm 900 --all
-  python3 import.py local-lvm 900 --only-new
-  python3 import.py local-lvm 900 'ubuntu-*',rocky --mirror tsinghua
-  python3 import.py local-lvm 900 --bridge vmbr1 --memory 1024 --cores 2
+  python3 import.py local-lvm 9001
+  python3 import.py local-lvm 9001 --all
+  python3 import.py local-lvm 9001 --only-new
+  python3 import.py local-lvm 9001 'ubuntu-*',rocky --mirror tsinghua
+  python3 import.py local-lvm 9001 --bridge vmbr1 --memory 1024 --cores 2
   python3 import.py --list'''
 
 
+_CONFIG_CACHE: Optional[dict] = None
+
+
 def load_config() -> dict:
+    global _CONFIG_CACHE
+    if _CONFIG_CACHE is not None:
+        return _CONFIG_CACHE
     cfg_path = os.path.join(SCRIPT_DIR, 'templates.yaml')
     with open(cfg_path, 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f) or {}
+    for tpl in config.get('templates', []) or []:
+        if not TEMPLATE_NAME_RE.match(str(tpl.get('name', ''))):
+            raise pitlib.PitError(f'templates.yaml: invalid template name {tpl.get("name")!r}')
+    _CONFIG_CACHE = config
+    return config
 
 
 def print_template_list():
     config = load_config()
     _, existing = cluster_vm_index()
+    existing_lower = {n.lower() for n in existing}
     defaults = default_families(config)
     groups = {}
     for t in config.get('templates', []):
@@ -810,10 +1124,16 @@ def print_template_list():
         for t in tpls:
             name = t['name']
             flags = []
-            if name in existing:
+            if name.lower() in existing_lower:
                 flags.append('已存在')
             if t.get('net_tuning', True) is False:
                 flags.append('调优:关')
+            if t.get('upgrade', True) is False:
+                flags.append('升级:关')
+            if t.get('discover'):
+                flags.append('自动找最新版')
+            if t.get('checksum'):
+                flags.append('校验')
             suffix = f'  [{", ".join(flags)}]' if flags else ''
             print(f'    - {name}{suffix}')
     print(f'\n默认系列：{", ".join(defaults)}（--all 导入全部；选择器可直接写系列名）')
@@ -836,14 +1156,10 @@ def main():
         os.execv(sys.executable, [sys.executable, tui, *rest])
 
     # 依赖检查（只验证存在，不强制版本）
-    try:
-        subprocess.call(['virt-customize', '--version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.call(['pvesh', 'version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.call(['qm', 'version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except FileNotFoundError:
-        print('Some dependencies are missing.')
-        print('Please ensure virt-customize / pvesh / qm are available on this host.')
-        sys.exit(2)
+    for tool in ('virt-customize', 'pvesh', 'qm'):
+        if shutil.which(tool) is None:
+            print(f'Missing dependency: {tool}. Please ensure virt-customize / pvesh / qm are available (run setup.sh).')
+            sys.exit(2)
 
     if len(sys.argv) < 3:
         print(USAGE)
@@ -857,10 +1173,11 @@ def main():
         sys.exit(1)
 
     # 解析可选参数
-    template_filter = None
+    filters = []
     only_new = False
     refresh = False
     apply_tuning = True
+    upgrade = True
     insecure = False
     import_all = False
     dry_run = False
@@ -885,6 +1202,8 @@ def main():
             refresh = True
         elif arg == '--no-tuning':
             apply_tuning = False
+        elif arg == '--no-upgrade':
+            upgrade = False
         elif arg == '--insecure':
             insecure = True
         elif arg == '--all':
@@ -895,6 +1214,9 @@ def main():
             mirror_name = take_value(arg)
         elif arg == '--bridge':
             vm_opts['bridge'] = take_value(arg)
+            if not re.fullmatch(r'[A-Za-z0-9_.-]{1,32}', vm_opts['bridge']):
+                print('Error: --bridge has an invalid value.')
+                sys.exit(1)
         elif arg in ('--memory', '--cores'):
             value = take_value(arg)
             if not value.isdigit() or int(value) <= 0:
@@ -902,12 +1224,13 @@ def main():
                 sys.exit(1)
             vm_opts[arg[2:]] = int(value)
         elif not arg.startswith('-'):
-            template_filter = arg
+            filters.append(arg)   # 多个选择器合并（旧版只保留最后一个）
         else:
             print(f'Error: unknown option "{arg}".')
             print(USAGE)
             sys.exit(1)
         i += 1
+    template_filter = ','.join(filters) or None
 
     if insecure:
         disable_tls_verification()
@@ -934,10 +1257,11 @@ def main():
     to_import_all = match_templates(all_tpls, template_filter, families)
     if not to_import_all:
         print('No templates matched. Use --list to see available templates.')
-        return
+        sys.exit(1)
 
-    # 跨集群收集已用 VMID / 名称：--only-new 跨节点判断，VMID 分配自动跳过已占用（集群内 VMID 全局唯一）
-    used_vmids, existing_names = cluster_vm_index()
+    # VMID 跨集群判断占用（全局唯一）；「是否已存在」只看本节点（每个节点用本地存储时各有一份同名模板）
+    used_vmids, _cluster_names = cluster_vm_index()
+    existing_names = list_existing_vm_names()
     if only_new:
         skipped = [t['name'] for t in to_import_all if t['name'] in existing_names]
         if skipped:
@@ -951,52 +1275,55 @@ def main():
         print('\n导入计划（--dry-run，不会下载或创建）：')
         planned = start_vmid
         for tpl in to_import_all:
+            if tpl['name'] in existing_names:
+                print(f'  {"-":>6}  {tpl["name"]}  (已存在，将跳过)')
+                continue
             while planned in used_vmids:
                 planned += 1
-            note = '  (已存在，将跳过)' if tpl['name'] in existing_names else ''
-            print(f'  {planned:>6}  {tpl["name"]}{note}')
+            print(f'  {planned:>6}  {tpl["name"]}')
             used_vmids.add(planned)
             planned += 1
         opts = dict(VM_DEFAULTS)
         opts.update(vm_opts)
         print(f'\nstorage={storage.name} bridge={opts["bridge"]} memory={opts["memory"]} cores={opts["cores"]} '
-              f'tuning={"on" if apply_tuning else "off"} mirror={mirror_name or "-"}')
+              f'tuning={"on" if apply_tuning else "off"} upgrade={"on" if upgrade else "off"} mirror={mirror_name or "-"}')
         return
 
     print(f'镜像缓存目录：{CACHE_DIR}')
     vmid = start_vmid
     results = {'ok': [], 'skipped': [], 'failed': []}
-    for tpl in to_import_all:
-        while vmid in used_vmids:
-            print(f'VMID {vmid} 已被占用（集群内），跳过。')
+    with pitlib.ToolLock():
+        for tpl in to_import_all:
+            while vmid in used_vmids:
+                print(f'VMID {vmid} 已被占用（集群内），跳过。')
+                vmid += 1
+            try:
+                status = import_template(
+                    tpl,
+                    storage,
+                    vmid,
+                    keep_image=not refresh,
+                    refresh=refresh,
+                    mirror_config=mirror_config,
+                    apply_tuning=apply_tuning,
+                    vm_opts=vm_opts,
+                    mirror_name=mirror_name,
+                    upgrade=upgrade,
+                )
+            except (DownloadError, pitlib.PitError, subprocess.CalledProcessError, OSError) as exc:
+                reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+                print(f'\nError: 导入 {tpl["name"]} 失败：{reason}\n', file=sys.stderr)
+                results['failed'].append((tpl['name'], reason))
+                # 失败的号可能被别人占着（并发创建 / 非本工具的 VM）：跳过它，别让后续模板在同一个号上连环失败
+                used_vmids.add(vmid)
+                vmid += 1
+                continue
+            if status == 'skipped':
+                results['skipped'].append((tpl['name'], vmid))
+                continue
+            results['ok'].append((tpl['name'], vmid))
+            used_vmids.add(vmid)
             vmid += 1
-        try:
-            status = import_template(
-                tpl,
-                storage,
-                vmid,
-                keep_image=not refresh,
-                refresh=refresh,
-                mirror_config=mirror_config,
-                apply_tuning=apply_tuning,
-                vm_opts=vm_opts
-            )
-        except DownloadError as exc:
-            print(f'\nError: {exc}\n', file=sys.stderr)
-            results['failed'].append((tpl['name'], str(exc).splitlines()[0]))
-            continue
-        except subprocess.CalledProcessError as exc:
-            cmd = exc.cmd if isinstance(exc.cmd, str) else ' '.join(map(str, exc.cmd))
-            reason = f'命令失败（退出码 {exc.returncode}）：{cmd[:120]}'
-            print(f'\nError: 导入 {tpl["name"]} 失败：{reason}\n', file=sys.stderr)
-            results['failed'].append((tpl['name'], reason))
-            continue
-        if status == 'skipped':
-            results['skipped'].append((tpl['name'], vmid))
-            continue
-        results['ok'].append((tpl['name'], vmid))
-        used_vmids.add(vmid)
-        vmid += 1
 
     print_summary(results)
     if results['failed']:
@@ -1005,8 +1332,12 @@ def main():
 
 if __name__ == '__main__':
     try:
+        pitlib.raise_on_sigterm()
         main()
-    except DownloadError as exc:
+    except pitlib.LockBusy as exc:
+        print(f'\nError: {exc}', file=sys.stderr)
+        sys.exit(3)
+    except (DownloadError, pitlib.PitError) as exc:
         print(f'\nError: {exc}', file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:

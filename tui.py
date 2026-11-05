@@ -516,10 +516,10 @@ class Wizard:
 
     def step_vmid(self):
         st = self.state
-        default = str(st.get('start_vmid') or 9000)
+        default = str(st.get('start_vmid') or 9001)
         while True:
             text = ('模板从该 VMID 起依次编号；集群内已被占用的 VMID 会自动跳过。\n'
-                    '建议使用一个专门的区间（如 9000-9999）便于管理。')
+                    '建议使用 9001-9999（rhapsi 平台只识别这个区间的模板）。')
             value = self.ui.inputbox('2/6 起始 VMID', text, default)
             if value.isdigit() and 100 <= int(value) <= 999999999:
                 vmid = int(value)

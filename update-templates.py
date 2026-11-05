@@ -85,6 +85,8 @@ import subprocess
 import time
 from typing import Optional
 
+import pitlib
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOADS = os.path.join(SCRIPT_DIR, 'uploads')
 
@@ -95,7 +97,8 @@ PERMIT_ROOT_SCRIPT = os.path.join(UPLOADS, 'permit-root-login.sh')
 # virt-customize 输出中出现这些关键字，说明是 libguestfs appliance 起不来（宿主机环境问题），
 # 而不是某个模板 / 脚本本身的问题
 LAUNCH_FAILURE_MARKERS = ('guestfs_launch', 'appliance', 'supermin', 'could not access KVM', '/dev/kvm')
-LOG_DIR = '/tmp/pve-import-template'
+# 失败日志放 root 专属目录（旧版写 /tmp 下可预测的路径，本地用户可预先放符号链接让 root 覆盖任意文件）
+LOG_DIR = pitlib.LOG_DIR
 
 
 class LaunchError(RuntimeError):
@@ -180,9 +183,11 @@ def save_failure_log(vmid: int, name: str, stderr: str) -> Optional[str]:
     if not stderr:
         return None
     try:
-        os.makedirs(LOG_DIR, exist_ok=True)
+        os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)
+        os.chmod(LOG_DIR, 0o700)
         path = os.path.join(LOG_DIR, f'update-{vmid}-{time.strftime("%Y%m%d-%H%M%S")}.log')
-        with open(path, 'w', encoding='utf-8', errors='replace') as fh:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8', errors='replace') as fh:
             fh.write(f'# {vmid} ({name})\n{stderr}')
         return path
     except OSError:
@@ -454,6 +459,7 @@ def parse_args(argv):
     want_all = False
     include_vms = False
     apply_tuning = True
+    tuning_explicit = False
     qga = False
     permit_root = False
     extra_runs = []
@@ -499,6 +505,7 @@ def parse_args(argv):
             include_vms = True
         elif a == '--tuning':
             apply_tuning = True
+            tuning_explicit = True
         elif a == '--no-tuning':
             apply_tuning = False
         elif a == '--qga':
@@ -535,7 +542,7 @@ def parse_args(argv):
         i += 1
 
     return dict(selectors=selectors, want_all=want_all, include_vms=include_vms,
-                apply_tuning=apply_tuning, qga=qga, permit_root=permit_root,
+                apply_tuning=apply_tuning, tuning_explicit=tuning_explicit, qga=qga, permit_root=permit_root,
                 extra_runs=extra_runs, dry_run=dry_run, assume_yes=assume_yes,
                 do_list=do_list, node=node, all_nodes=all_nodes,
                 force_tcg=force_tcg, debug=debug, mirror=mirror,
@@ -597,9 +604,14 @@ def main():
     actions = build_actions(opts['apply_tuning'], opts['qga'], opts['permit_root'], opts['extra_runs'])
     pveimport, mirror_config = load_mirror_config(opts['mirror'])
     templates_config = None
-    if opts['reapply']:
+    if opts['reapply'] or (opts['apply_tuning'] and not opts['tuning_explicit']):
         pveimport = pveimport or load_import_module()
         templates_config = pveimport.load_config()
+    # 默认动作（网络调优）尊重 templates.yaml 里的 net_tuning: false（Alpine）；显式 --tuning 才强制
+    no_tuning_names = set()
+    if templates_config and not opts['tuning_explicit']:
+        no_tuning_names = {t['name'].lower() for t in templates_config.get('templates', [])
+                           if t.get('net_tuning', True) is False}
     if not actions and not mirror_config and not opts['reapply']:
         print('没有要执行的动作（用了 --no-tuning 却没指定 --qga/--permit-root/--mirror/--reapply/--run）。')
         sys.exit(1)
@@ -670,6 +682,14 @@ def main():
         if ans not in ('y', 'yes'):
             print('已取消。')
             return
+
+    print('提示：要换成全新构建（上游新镜像 + 包升级 + 不就地改基卷），请用 sync-templates.py。')
+    lock = pitlib.ToolLock() if not opts['dry_run'] else contextlib.nullcontext()
+    try:
+        lock.__enter__()
+    except pitlib.LockBusy as e:
+        print(f'Error: {e}')
+        sys.exit(3)
 
     ok, failed, skipped = 0, 0, 0
     failed_names = []
@@ -753,7 +773,10 @@ def main():
                 va += reapply_args
             else:
                 print(f'  提示：templates.yaml 中 {name} 没有 customize 配置，跳过 --reapply。')
-        for _, args in actions:
+        for label, args in actions:
+            if label == 'net-tuning' and name.lower() in no_tuning_names:
+                print(f'  提示：templates.yaml 中 {name} 设了 net_tuning: false，跳过网络调优（--tuning 可强制）。')
+                continue
             va += args
         if not va:
             print('  跳过：没有适用于该目标的动作。')
