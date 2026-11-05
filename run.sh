@@ -7,13 +7,17 @@
 #
 # 用法：
 #   bash run.sh                                  # 交互向导（默认只勾选主流系列 ubuntu/debian/centos/alpine）
-#   bash run.sh local-lvm 9000                   # 向导，预填存储 / 起始 VMID
+#   bash run.sh local-lvm 9001                   # 向导，预填存储 / 起始 VMID
 #   bash run.sh -y [storage] [vmid] [import.py 参数...]
 #                                                # 非交互：直接导入（默认主流系列 + --only-new）
-#   bash run.sh -y local-lvm 9000 --all          # 非交互导入全部模板
+#   bash run.sh -y local-lvm 9001 --all          # 非交互导入全部模板
+#                                                # （起始 VMID 默认 9001：rhapsi 只识别 9001-9999 的模板）
 #   bash run.sh update                           # 更新已导入模板的向导（补调优 / qga / root 登录 / 换源）
 #   bash run.sh -y update --all --qga            # 非交互：等价 python3 update-templates.py --all --qga -y
-#   curl -fsSL <run.sh 地址> | bash -s -- -y local-lvm 9000
+#   bash run.sh sync [选择器...] [选项]          # 重建过期模板（新建→切换→回收），等价 python3 sync-templates.py
+#   bash run.sh sync alpine --force              # 立即重建本节点所有 Alpine 模板（安全补丁）
+#   bash run.sh timer install|remove|status      # 安装 / 移除每日自动 sync 的 systemd timer
+#   curl -fsSL <run.sh 地址> | bash -s -- -y local-lvm 9001
 #
 # 选项：
 #   -y, --yes        非交互模式（无终端时自动启用）
@@ -61,7 +65,7 @@ for arg in "$@"; do
         --setup-only)  setup_only=1 ;;
         --text)        text_ui=1 ;;
         -h|--help)     usage; exit 0 ;;
-        import|update)
+        import|update|sync|timer)
             if [ -z "$mode" ] && [ "${#positional[@]}" -eq 0 ]; then
                 mode="$arg"
             else
@@ -183,6 +187,17 @@ fi
 command -v qm >/dev/null 2>&1 || die '未找到 qm：本工具需要在 Proxmox VE 宿主机上运行。'
 
 # ---------------------------------------------------------------------------
+# sync / timer：非交互，直接透传（没有向导）
+# ---------------------------------------------------------------------------
+if [ "$mode" = sync ]; then
+    log "python3 sync-templates.py ${positional[*]} ${extra_args[*]}"
+    exec python3 ./sync-templates.py "${positional[@]}" "${extra_args[@]}"
+fi
+if [ "$mode" = timer ]; then
+    exec bash ./install-timer.sh "${positional[@]}" "${extra_args[@]}"
+fi
+
+# ---------------------------------------------------------------------------
 # 导入
 # ---------------------------------------------------------------------------
 tui_args=()
@@ -208,7 +223,7 @@ if [ "$mode" = update ]; then
 fi
 
 storage="${positional[0]:-local-lvm}"
-start_vmid="${positional[1]:-9000}"
+start_vmid="${positional[1]:-9001}"
 import_args=()
 [ "${#positional[@]}" -ge 3 ] && import_args+=("${positional[2]}")
 import_args+=("${extra_args[@]}")

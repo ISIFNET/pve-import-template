@@ -1,0 +1,41 @@
+# /etc/pve-import-template.conf —— sync-templates.py 的节点配置（KEY=VALUE；不经 shell，不展开变量）
+# 命令行参数优先于这里。非法值会让 sync 拒绝运行（宁可不跑，也不按半份配置跑）。
+
+# 维护哪些模板：PROFILE 取 templates.yaml 里 profiles 的名字（minimal / standard / full），
+# 或 SELECTOR 写名字 / glob / 系列 / @profile，逗号分隔。都不写 = templates.yaml 全部（只维护本节点已有的）。
+# 小硬盘节点建议 PROFILE=minimal。
+PROFILE=
+SELECTOR=
+
+# 1 = 也导入组内本节点还没有的模板（需要 STORAGE）；0 = 只维护已有的
+ADD_MISSING=0
+# 新导入模板用的存储（重建沿用旧模板所在的存储）
+STORAGE=
+# 新模板网卡接的网桥（重建沿用旧模板的网桥）
+BRIDGE=
+
+# 新模板 VMID 区间（rhapsi 平台只识别 9001-9999）
+VMID_MIN=9001
+VMID_MAX=9999
+
+# 距上次构建超过多少天就重建一次（拿包升级里的安全补丁）；0 = 只在上游镜像 / 注入配方变化时重建
+MAX_AGE_DAYS=30
+# 每轮最多构建几个（其余记 deferred，下一轮再建；0 = 不限）
+MAX_BUILDS=3
+# 每个模板保留几个已退役版本用于回滚（刚退役的总会保留至少 12 小时）；小硬盘可设 0
+KEEP_RETIRED=1
+# 1 = 保留下载缓存（重复构建省流量）；0 = 构建完删掉，只留元数据
+KEEP_CACHE=0
+
+# 构建时包升级 / 网络调优（1 开 0 关）
+UPGRADE=1
+NET_TUNING=1
+# 镜像内换源（templates.yaml mirrors 的名字，留空不换）
+MIRROR=
+
+# 失败后的退避（小时，连续失败翻倍，封顶 7 天；上游 404 固定 7 天；改了 templates.yaml 立即重试）
+BACKOFF_HOURS=20
+
+# 切换前的开机冒烟：从新模板克隆一台不接网卡的临时 VM，等 qemu-guest-agent 应答（秒）；嵌套 / TCG 节点调大
+SMOKE_TEST=1
+SMOKE_TIMEOUT=600

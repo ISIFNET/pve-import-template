@@ -1,0 +1,20 @@
+[Unit]
+Description=Rebuild outdated Proxmox VM templates (pve-import-template sync)
+Documentation=https://github.com/ISIFNET/pve-import-template
+After=network-online.target pve-cluster.service
+Wants=network-online.target
+ConditionPathExists=/etc/pve/local
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 @INSTALL_DIR@/sync-templates.py --config /etc/pve-import-template.conf --json
+# JSON 报告同时写在 /var/lib/pve-import-template/last-run.json，stdout 不必进 journal
+StandardOutput=null
+StandardError=journal
+Nice=10
+IOSchedulingClass=idle
+# 每轮最多 MAX_BUILDS 个模板；单个模板定制上限 1 小时
+TimeoutStartSec=6h
+KillMode=mixed
+# 3 = 另一个实例（手动 / 平台的 Run now）正在跑：不是失败，别让单元变 failed 触发告警
+SuccessExitStatus=3
