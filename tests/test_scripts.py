@@ -60,5 +60,12 @@ class UpgradeScriptTest(unittest.TestCase):
         self.assertTrue([l for l in code if l.strip().startswith('APT_OPTS=')])
 
 
+class SystemdUnitTest(unittest.TestCase):
+    def test_lock_busy_and_no_quorum_are_not_unit_failures(self):
+        with open(os.path.join(ROOT, 'systemd', 'pve-template-sync.service.in')) as fh:
+            lines = [l.strip() for l in fh if l.strip().startswith('SuccessExitStatus=')]
+        self.assertEqual(lines, ['SuccessExitStatus=3 4'])
+
+
 if __name__ == '__main__':
     unittest.main()

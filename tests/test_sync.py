@@ -99,8 +99,12 @@ class FakeImport:
         meta = {'v': 1, 'name': tpl['name'], 'built_at': int(time.time()), 'source': {'url': tpl['url']},
                 'checksum_verified': True, 'recipe': 'r1', 'tool': '2.0.0', 'vmid': vid,
                 'carried': sorted((kw.get('extra_config') or {}).keys())}
-        self.node.add(vid, vm_name, meta=meta, tags=['pit'])
+        # 新模板的实际配置带上沿用的键（sync 切换前会读回来核对 hookscript）
+        cfg = {k: v for k, v in (kw.get('extra_config') or {}).items() if k not in self.drop_keys}
+        self.node.add(vid, vm_name, meta=meta, tags=['pit'], cfg=cfg)
         return meta
+
+    drop_keys = ()
 
 
 def args_for(argv):
@@ -120,6 +124,13 @@ class SyncTest(unittest.TestCase):
             mock.patch.object(pitlib, 'linked_clone_refs', lambda vmid, nodes_dir=None: []),
             mock.patch.object(pitlib, 'http_head', lambda url: {'etag': 'e1'}),
             mock.patch.object(sync, 'STATE_FILE', os.path.join(self.tmp.name, 'last-run.json')),
+            # 2.2.0：宿主机探测 / 存储查询 / 共享游标全部打桩（不读这台测试机的 /proc、不跑 pvesh）
+            mock.patch.object(pitlib, 'SHARED_HW_FILE', os.path.join(self.tmp.name, 'pit-vmid-hw')),
+            mock.patch.object(pitlib, 'host_cpu_level', lambda path=None: 4),
+            mock.patch.object(pitlib, 'mem_available_mb', lambda path=None: 64 * 1024),
+            mock.patch.object(pitlib, 'storage_type', lambda storage: 'lvmthin'),
+            mock.patch.object(pitlib, 'storage_config', lambda storage: {'type': 'lvmthin', 'content': 'images,rootdir'}),
+            mock.patch.object(pitlib, 'cluster_quorate', lambda: None),
         ]
         for p in patches:
             p.start()
@@ -187,9 +198,9 @@ class SyncTest(unittest.TestCase):
         self.node.add(9012, 'ubuntu-24.04', meta=self.fresh_meta('ubuntu-24.04', 'https://u/old.img'))
         imp = FakeImport(self.node, [{'name': 'debian-13', 'url': 'https://d/13.qcow2'},
                                      {'name': 'ubuntu-24.04', 'url': 'https://u/new.img'}])
-        report = self.run_with(imp, ['--max-builds', '1'])
+        report = self.run_with(imp, ['--max-builds', '1'], dict(self.conf, SOURCE_DELAY_HOURS='0'))
         actions = {r['name']: r['action'] for r in report['templates']}
-        # source-changed（上游新镜像）优先于 legacy
+        # source-changed（上游新镜像）优先于 legacy（金丝雀节点：新镜像不等待）
         self.assertEqual(actions, {'ubuntu-24.04': 'built', 'debian-13': 'deferred'})
 
     def test_absent_templates_are_not_imported_without_add_missing(self):
@@ -230,7 +241,9 @@ class SyncTest(unittest.TestCase):
         self.node.add(9010, 'debian-13')
         imp = FakeImport(self.node, [{'name': 'debian-13', 'url': 'https://d/13'}])
         report = self.run_with(imp, [], dict(self.conf, ADOPT_LEGACY='0'))
-        self.assertEqual(report['templates'][0]['action'], 'legacy')
+        # 2.2.0 起行 action 收敛到固定词表：旧的 action=legacy 改为 skipped + reason=legacy
+        self.assertEqual(report['templates'][0]['action'], 'skipped')
+        self.assertEqual(report['templates'][0]['reason'], 'legacy')
         self.assertEqual(imp.built, [])
 
     def test_eol_templates_sort_last_and_are_not_rebuilt_by_age(self):

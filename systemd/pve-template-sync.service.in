@@ -16,5 +16,6 @@ IOSchedulingClass=idle
 # 每轮最多 MAX_BUILDS 个模板；单个模板定制上限 1 小时
 TimeoutStartSec=6h
 KillMode=mixed
-# 3 = 另一个实例（手动 / 平台的 Run now）正在跑：不是失败，别让单元变 failed 触发告警
-SuccessExitStatus=3
+# 3 = 另一个实例（手动 / 平台的 Run now）正在跑；4 = 集群暂时没有 quorum、整轮跳过（状态文件里有 message）：
+# 都不是失败，别让单元变 failed 触发告警
+SuccessExitStatus=3 4

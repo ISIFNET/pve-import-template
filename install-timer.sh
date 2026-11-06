@@ -54,9 +54,15 @@ case "$cmd" in
 import json, sys, time
 doc = json.load(open(sys.argv[1]))
 when = doc.get('finished_at') or doc.get('started_at')
-print('last run: %s  running=%s ok=%s  %s' % (
+print('last run: %s  running=%s ok=%s%s  %s' % (
     time.strftime('%Y-%m-%d %H:%M', time.localtime(when)) if when else '-', doc.get('running'), doc.get('ok'),
-    ', '.join('%s %d' % kv for kv in sorted((doc.get('summary') or {}).items()))))
+    ' PAUSED' if doc.get('paused') else '',
+    ', '.join('%s %d' % kv for kv in sorted((doc.get('summary') or {}).items()) if kv[1])))
+if doc.get('message'):
+    print('  %s' % doc['message'])
+for name, hold in sorted((doc.get('holds') or {}).items()):
+    print('  hold         %-24s since %s (%s)' % (name, time.strftime('%Y-%m-%d %H:%M', time.localtime(hold.get('at') or 0)),
+                                                hold.get('by') or 'manual'))
 for row in doc.get('templates') or []:
     if row.get('action') not in ('current', 'absent'):
         print('  %-12s %-24s %s' % (row.get('action'), row.get('name'), row.get('detail') or ''))
