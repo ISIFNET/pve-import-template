@@ -23,7 +23,8 @@ update-templates.py - 对「已经导入 PVE 的虚拟机模板」就地重新�
 选择器（可混用，留空时必须配合 --all）
   <vmid>            指定 VMID，如 9000
   <name|glob>       按模板名匹配，支持通配，如 'ubuntu-*'
-  --all             选择所有「模板」VM
+  --all             选择所有「模板」VM（默认跳过带 pit tag 的：2.x 蓝绿托管的模板只能用 sync-templates.py 换新，
+                    就地改基卷会改坏链接克隆、改动也会被下一次重建覆盖；确要处理加 --include-managed）
 
 动作（不指定动作时，默认仅执行「网络调优」）
   --tuning          应用网络/内核调优（默认开启；用 --no-tuning 关闭）
@@ -36,6 +37,7 @@ update-templates.py - 对「已经导入 PVE 的虚拟机模板」就地重新�
 
 选项
   --vms             允许选中非模板的普通 VM（必须处于 stopped 状态）
+  --include-managed --all 也处理 sync-templates.py 托管的模板（带 pit tag）
   --skip-cloned     跳过已有链接克隆（linked clone）的模板，避免影响克隆出的 VM
   --no-lock         修改期间不给 VM 加 PVE 锁（默认加 lock=clone，防止同时被克隆/备份）
   --node <name>     指定作用的 PVE 节点（默认自动识别为本节点）
@@ -247,6 +249,7 @@ def list_vms() -> list:
                 'template': int(r.get('template', 0) or 0),
                 'status': r.get('status', ''),
                 'node': r.get('node', ''),
+                'tags': pitlib.parse_tags(r.get('tags')),
             })
         return vms
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
@@ -265,14 +268,11 @@ def list_vms() -> list:
                 vmid = int(cols[0])
             except ValueError:
                 continue
-            vms.append({'vmid': vmid, 'name': cols[1], 'template': _is_template(vmid),
-                        'status': cols[2], 'node': ''})
+            cfg = get_config(vmid)
+            vms.append({'vmid': vmid, 'name': cols[1],
+                        'template': 1 if cfg.get('template', '').strip() in ('1', 'true', 'yes') else 0,
+                        'status': cols[2], 'node': '', 'tags': pitlib.parse_tags(cfg.get('tags'))})
     return vms
-
-
-def _is_template(vmid: int) -> int:
-    cfg = get_config(vmid)
-    return 1 if cfg.get('template', '').strip() in ('1', 'true', 'yes') else 0
 
 
 def get_config(vmid: int) -> dict:
@@ -394,10 +394,16 @@ def lv_deactivate(lv: str, dry_run: bool):
     run(['lvchange', '-an', lv], dry_run=dry_run)
 
 
-def select_targets(vms: list, selectors: list, want_all: bool, include_vms: bool) -> list:
+def is_managed(vm: dict) -> bool:
+    """sync-templates.py（2.x）托管的模板：带 pit tag。"""
+    return pitlib.TAG_MANAGED in (vm.get('tags') or [])
+
+
+def select_targets(vms: list, selectors: list, want_all: bool, include_vms: bool, include_managed: bool = False) -> list:
     pool = vms if include_vms else [v for v in vms if v['template'] == 1]
     if want_all:
-        return pool
+        # 托管模板不能就地改：基卷被链接克隆共享，改了也会被下一次蓝绿重建覆盖。显式按名字 / VMID 选的照旧（会告警）
+        return pool if include_managed else [v for v in pool if not is_managed(v)]
     selected = []
     seen = set()
     for sel in selectors:
@@ -474,6 +480,7 @@ def parse_args(argv):
     reapply = False
     skip_cloned = False
     use_lock = True
+    include_managed = False
 
     i = 0
     while i < len(argv):
@@ -503,6 +510,8 @@ def parse_args(argv):
             all_nodes = True
         elif a == '--vms':
             include_vms = True
+        elif a == '--include-managed':
+            include_managed = True
         elif a == '--tuning':
             apply_tuning = True
             tuning_explicit = True
@@ -546,7 +555,7 @@ def parse_args(argv):
                 extra_runs=extra_runs, dry_run=dry_run, assume_yes=assume_yes,
                 do_list=do_list, node=node, all_nodes=all_nodes,
                 force_tcg=force_tcg, debug=debug, mirror=mirror,
-                reapply=reapply, skip_cloned=skip_cloned, use_lock=use_lock)
+                reapply=reapply, skip_cloned=skip_cloned, use_lock=use_lock, include_managed=include_managed)
 
 
 def print_list(vms: list, scope: str = ''):
@@ -625,7 +634,16 @@ def main():
                     print(f'Error: 脚本不存在：{spath}')
                     sys.exit(1)
 
-    targets = select_targets(node_vms, opts['selectors'], opts['want_all'], opts['include_vms'])
+    targets = select_targets(node_vms, opts['selectors'], opts['want_all'], opts['include_vms'], opts['include_managed'])
+    if opts['want_all'] and not opts['include_managed']:
+        managed = [v for v in node_vms if v['template'] == 1 and is_managed(v)]
+        if managed:
+            print('--all：跳过 sync-templates.py 托管的模板（带 pit tag，用 sync-templates.py 换新；确要就地改加 --include-managed）：'
+                  + ', '.join(f'{v["vmid"]}({v["name"]})' for v in managed))
+    explicit_managed = [v for v in targets if is_managed(v)] if opts['selectors'] else []
+    if explicit_managed:
+        print('Warning: 以下模板由 sync-templates.py 托管（pit tag），就地修改会在下次重建时丢失，且影响链接克隆：'
+              + ', '.join(f'{v["vmid"]}({v["name"]})' for v in explicit_managed))
 
     # 对「明确按 VMID 指定、但其实位于其他节点」的选择器给出可执行的提示
     if not opts['all_nodes'] and local:
