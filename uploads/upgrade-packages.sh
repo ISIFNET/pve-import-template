@@ -74,7 +74,9 @@ apt_switch_to_archive() {
 
 if command -v apt-get >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
-  APT_OPTS="-y -o Acquire::Retries=3 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o APT::Install-Recommends=false -o APT::Get::Always-Include-Phased-Updates=true"
+  # 不加 Always-Include-Phased-Updates：Ubuntu 分阶段推送的更新正是还在观察期的版本，模板会发给每一台新 VM，
+  # 不该比普通机器更早吃到可能被撤回的包
+  APT_OPTS="-y -o Acquire::Retries=3 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o APT::Install-Recommends=false"
   if ! retry apt-get -o Acquire::Retries=3 update; then
     apt_switch_to_archive || { log "apt-get update failed"; exit 1; }
     apt-get -o Acquire::Retries=3 update || { log "apt-get update failed even against the archive"; exit 1; }
@@ -87,18 +89,19 @@ if command -v apt-get >/dev/null 2>&1; then
   exit 0
 fi
 
+# EL 的镜像站同样有同步窗口（repomd 与包不一致 / 连接重置）：和 apt 一样重试两次再判失败
 if command -v dnf >/dev/null 2>&1; then
-  dnf -y upgrade --refresh || { log "dnf upgrade failed"; exit 1; }
+  retry dnf -y upgrade --refresh || { log "dnf upgrade failed"; exit 1; }
   log "dnf upgrade done"
   exit 0
 fi
 if command -v yum >/dev/null 2>&1; then
-  yum -y update || { log "yum update failed"; exit 1; }
+  retry yum -y update || { log "yum update failed"; exit 1; }
   log "yum update done"
   exit 0
 fi
 if command -v microdnf >/dev/null 2>&1; then
-  microdnf -y upgrade || { log "microdnf upgrade failed"; exit 1; }
+  retry microdnf -y upgrade || { log "microdnf upgrade failed"; exit 1; }
   exit 0
 fi
 

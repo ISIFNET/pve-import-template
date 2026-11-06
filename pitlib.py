@@ -38,6 +38,10 @@ LOCK_FILE = os.environ.get('PIT_LOCK_FILE', '/run/lock/pve-import-template.lock'
 STATE_DIR = os.environ.get('PIT_STATE_DIR', '/var/lib/pve-import-template')
 LOG_DIR = os.environ.get('PIT_LOG_DIR', '/var/log/pve-import-template')
 PVE_NODES_DIR = os.environ.get('PIT_PVE_NODES_DIR', '/etc/pve/nodes')
+# 集群共享的 VMID 游标（pmxcfs，单行数字）：各节点各记各的高水位时，A 节点刚回收的号会被 B 节点马上用掉
+SHARED_HW_FILE = os.environ.get('PIT_SHARED_HW_FILE', '/etc/pve/pit-vmid-hw')
+MEMINFO = '/proc/meminfo'
+CPUINFO = '/proc/cpuinfo'
 
 HTTP_TIMEOUT = 60
 INDEX_MAX_BYTES = 8 * 1024 * 1024
@@ -57,6 +61,8 @@ RETIRED_INFIX = '-retired-'
 # virt-customize 输出中出现这些关键字，说明是 libguestfs appliance 起不来（宿主机环境问题），
 # 而不是某个模板 / 脚本本身的问题
 LAUNCH_FAILURE_MARKERS = ('guestfs_launch', 'appliance', 'supermin', 'could not access kvm', '/dev/kvm')
+# libguestfs appliance 的内存（MiB）
+LIBGUESTFS_MEMSIZE = 1024
 
 # qm config 中代表磁盘的前缀；EFI / TPM / cloudinit / cdrom 会被跳过
 DISK_PREFIXES = ('scsi', 'virtio', 'sata', 'ide')
@@ -83,6 +89,31 @@ class CommandError(PitError):
         super().__init__(message)
         self.returncode = returncode
         self.output = output
+
+
+class Deferred(PitError):
+    """资源暂时不够（磁盘 / 内存 / appliance 起不来 / 本轮时间用完）：这次不建、记 deferred，
+    不算失败、不进退避——等资源回来下一轮照常建。"""
+
+
+class SpaceError(Deferred):
+    """写入后剩余空间会低于保留量（或 thin pool 元数据快满）。消息以 `not enough space:` 开头。"""
+
+
+class NoQuorum(PitError):
+    """集群没有 quorum：/etc/pve 只读，qm create / set 全会失败，整轮跳过（退出码 4）。"""
+
+
+class GuestExecUnsupported(PitError):
+    """qemu-guest-agent 不支持（或禁用了）guest-exec：深度冒烟只能跳过。"""
+
+
+class GuestCommandMissing(PitError):
+    """guest-exec 能用，但来宾里没有这个命令。"""
+
+
+# qm create / clone / 卷分配撞号：集群里别的节点刚占了这个 VMID，或存储上有同号残留卷
+COLLISION_RE = re.compile(r'already exists|File exists')
 
 
 # ---------------------------------------------------------------- 锁 / 信号
@@ -202,6 +233,52 @@ def cluster_used_vmids() -> set:
     return used
 
 
+def cluster_quorate() -> Optional[bool]:
+    """集群是否有 quorum：True / False；单机（/cluster/status 里没有 cluster 条目）或查不到返回 None。
+
+    没 quorum 时 pmxcfs 只读：qm create / set 全部失败，跑下去只会把每个模板都记一次失败、进退避。
+    """
+    try:
+        status = pvesh_json('/cluster/status')
+    except (PitError, ValueError):
+        return None
+    for entry in status if isinstance(status, list) else []:
+        if isinstance(entry, dict) and entry.get('type') == 'cluster':
+            return str(entry.get('quorate')) in ('1', 'True', 'true')
+    return None
+
+
+def read_shared_high_water(path: Optional[str] = None) -> int:
+    """集群共享 VMID 游标（/etc/pve/pit-vmid-hw，单行数字）；不存在 / 读不了 / 内容不对返回 0。"""
+    with contextlib.suppress(OSError, ValueError):
+        with open(path or SHARED_HW_FILE, 'r') as fh:
+            text = fh.read(64).strip()
+        if re.fullmatch(r'[0-9]{1,9}', text):
+            return int(text)
+    return 0
+
+
+def write_shared_high_water(vmid: int, path: Optional[str] = None) -> bool:
+    """把刚分配的号写回共享游标。写失败不致命（pmxcfs 只读 / 单机没有 /etc/pve）：本地状态文件里还有一份。"""
+    path = path or SHARED_HW_FILE
+    try:
+        tmp = '%s.tmp.%d' % (path, os.getpid())
+        with open(tmp, 'w') as fh:
+            fh.write('%d\n' % int(vmid))
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        return False
+
+
+def combined_high_water(local: int, lo: int, hi: int, path: Optional[str] = None) -> int:
+    """max(本地游标, 共享游标)，只取落在 [lo, hi] 内的（别的节点配了不同区间时，它的游标对我们没意义）。"""
+    values = [int(v) for v in (local or 0, read_shared_high_water(path)) if lo <= int(v or 0) <= hi]
+    return max(values) if values else 0
+
+
 def parse_tags(raw) -> list:
     if not raw:
         return []
@@ -241,6 +318,54 @@ def node_vms(node: str) -> list:
 def vm_config(node: str, vmid: int) -> dict:
     cfg = pvesh_json('/nodes/%s/qemu/%d/config' % (node, int(vmid)))
     return cfg if isinstance(cfg, dict) else {}
+
+
+def parse_guest_exec(text: str) -> Optional[dict]:
+    """`qm guest exec` 的输出（JSON：exitcode / exited / out-data / err-data，前后可能夹着告警行）→
+    {exitcode, exited, out, err}；不是这种 JSON 返回 None。"""
+    text = text or ''
+    start, end = text.find('{'), text.rfind('}')
+    if start < 0 or end < start:
+        return None
+    try:
+        doc = json.loads(text[start:end + 1])
+    except ValueError:
+        return None
+    if not isinstance(doc, dict) or not ('exitcode' in doc or 'exited' in doc):
+        return None
+    code = doc.get('exitcode')
+    return {'exitcode': int(code) if isinstance(code, (int, float)) or str(code).isdigit() else None,
+            'exited': str(doc.get('exited', 0)) in ('1', 'True', 'true'),
+            'out': str(doc.get('out-data') or ''), 'err': str(doc.get('err-data') or '')}
+
+
+_EXEC_UNSUPPORTED_RE = re.compile(r'guest-exec\S*\s+has\s+(?:not\s+been\s+found|been\s+disabled)|not currently supported'
+                                  r'|unsupported command', re.I)
+_EXEC_MISSING_RE = re.compile(r'no such file or directory|failed to execute child process', re.I)
+
+
+def guest_exec(vmid: int, argv: list, timeout: int = 30, log=None) -> dict:
+    """在来宾里跑一条命令（经 qemu-guest-agent，argv 原样传，不经宿主机 shell），返回 parse_guest_exec 的结果。
+
+    agent 太老 / 禁用了 guest-exec 抛 GuestExecUnsupported；来宾里没有这个命令抛 GuestCommandMissing。
+    来宾命令非 0 退出不算异常（看返回的 exitcode）。
+    """
+    cmd = ['qm', 'guest', 'exec', int(vmid), '--timeout', int(timeout), '--', *argv]
+    try:
+        out = run_cmd(cmd, timeout=int(timeout) + 60, log=log)
+    except CommandError as e:
+        parsed = parse_guest_exec(e.output)
+        if parsed is not None:
+            return parsed
+        if _EXEC_UNSUPPORTED_RE.search(e.output or ''):
+            raise GuestExecUnsupported('guest agent does not support exec: %s' % (e.output or '').strip()[:200]) from None
+        if _EXEC_MISSING_RE.search(e.output or ''):
+            raise GuestCommandMissing('%s is not available in the guest' % argv[0]) from None
+        raise
+    parsed = parse_guest_exec(out)
+    if parsed is None:
+        raise PitError('unexpected output from qm guest exec: %s' % out.strip()[:200])
+    return parsed
 
 
 def find_os_disk_volid(cfg: dict) -> Optional[str]:
@@ -564,6 +689,9 @@ def run_virt_customize(image: str, args: list, *, timeout: int = 3600, force_tcg
     """
     def attempt(tcg: bool) -> str:
         env = {'LIBGUESTFS_BACKEND': 'direct'}
+        # appliance 默认内存在包升级（dnf 解依赖 / initramfs 重建）时偏紧；1 GiB 足够又不至于挤占宿主机。运维显式设了就尊重
+        if 'LIBGUESTFS_MEMSIZE' not in os.environ:
+            env['LIBGUESTFS_MEMSIZE'] = str(LIBGUESTFS_MEMSIZE)
         if tcg:
             env['LIBGUESTFS_BACKEND_SETTINGS'] = 'force_tcg'
         if debug:
@@ -658,19 +786,49 @@ def expand_profiles(selector: Optional[str], config: dict) -> Optional[str]:
     return ','.join(out)
 
 
-# ---------------------------------------------------------------- 磁盘空间
+# ---------------------------------------------------------------- 存储 / 磁盘空间 / 内存 / CPU
 
 GIB = 1024 ** 3
 
-
 FILE_STORAGE_TYPES = ('dir', 'nfs', 'cifs', 'glusterfs', 'btrfs')
+# 放不了模板的存储类型：厚置备 LVM 不支持基卷 / 链接克隆，iSCSI 直通只能挂整块 LUN，pbs / cephfs 不放 VM 盘
+NON_TEMPLATE_STORAGE_TYPES = ('lvm', 'iscsi', 'iscsidirect', 'pbs', 'cephfs', 'esxi')
+
+# 写入后至少要剩的空间：(最少字节, 占总量百分比)，取大者。缓存 / 工作目录多半在根分区（写满 = 节点出事），
+# 目标存储上还跑着客户 VM（精简置备写满 = 客户 VM 全部 io-error 暂停）
+CACHE_RESERVE = (10 * GIB, 10)
+STORAGE_RESERVE = (20 * GIB, 10)
+# lvmthin 的元数据写满比数据写满更糟（整个 pool 只读、可能要 thin_repair）：到这个比例就不再往里写模板
+THIN_META_MAX_PERCENT = 80.0
 
 
-def storage_type(storage: str) -> Optional[str]:
+def storage_config(storage: str) -> Optional[dict]:
+    """/storage/<id> 的配置（type / content / vgname / thinpool / disable …）；查不到返回 None。"""
     with contextlib.suppress(PitError, ValueError, TypeError):
         st = pvesh_json('/storage/%s' % storage)
         if isinstance(st, dict):
-            return st.get('type')
+            return st
+    return None
+
+
+def storage_type(storage: str) -> Optional[str]:
+    cfg = storage_config(storage)
+    return cfg.get('type') if cfg else None
+
+
+def storage_template_problem(storage: str) -> Optional[str]:
+    """这个存储能不能放新模板：不能返回原因（一句话），能或查不到返回 None（查不到不拦，交给构建本身报错）。"""
+    cfg = storage_config(storage)
+    if not cfg:
+        return None
+    stype = str(cfg.get('type') or '')
+    if stype in NON_TEMPLATE_STORAGE_TYPES:
+        return 'storage %s (type %s) cannot hold VM templates' % (storage, stype)
+    content = [c.strip() for c in str(cfg.get('content') or '').split(',') if c.strip()]
+    if content and 'images' not in content:
+        return 'storage %s does not allow VM images (content=%s)' % (storage, ','.join(content))
+    if str(cfg.get('disable', 0)) in ('1', 'True', 'true'):
+        return 'storage %s is disabled' % storage
     return None
 
 
@@ -696,12 +854,33 @@ def is_eol(template: dict, today: Optional[str] = None) -> bool:
 
 
 # 新模板要沿用旧模板的节点策略键（非磁盘 / 非网卡）。hookscript 最关键：平台用 API token，PVE 只许 root 设 hookscript，
-# 客户 VM 的 hook（VRF 路由注入 / cicustom / BCP38 / 端口隔离）全靠从模板克隆继承——新模板不带，VRF 节点上新开的 VM 就没网
+# 客户 VM 的 hook（VRF 路由注入 / cicustom / BCP38 / 端口隔离）全靠从模板克隆继承——新模板不带，VRF 节点上新开的 VM 就没网。
+# 值逐个按正则白名单校验（怪值丢弃、在结果里告警）；作为独立 argv 传给 qm，不经 shell。protection 故意不沿用：
+# 新模板开着保护，下一轮退役后 GC 永远删不掉它。
+_SNIPPET = r'[A-Za-z0-9_.-]+:snippets/[A-Za-z0-9_.-]+'
+_CICUSTOM_ITEM = r'(?:user|network|meta|vendor)=' + _SNIPPET
 CARRY_OVER_KEYS = {
-    'hookscript': r'[A-Za-z0-9_.-]+:snippets/[A-Za-z0-9_.-]+',
+    'hookscript': _SNIPPET,
     'vga': r'[A-Za-z0-9=,._-]{1,64}',
     'machine': r'[A-Za-z0-9=,.+_-]{1,64}',
+    'nameserver': r'[0-9A-Fa-f:.]{2,45}(?: [0-9A-Fa-f:.]{2,45}){0,7}',
+    'searchdomain': r'[A-Za-z0-9.-]{1,253}(?: [A-Za-z0-9.-]{1,253}){0,7}',
+    'cicustom': _CICUSTOM_ITEM + r'(?:,' + _CICUSTOM_ITEM + r'){0,3}',
+    'ciupgrade': r'[01]',
+    'numa': r'[01]',
+    'tablet': r'[01]',
+    'rng0': r'source=/dev/(?:urandom|random|hwrng)(?:,(?:max_bytes|period)=[0-9]{1,10}){0,2}',
+    'scsihw': r'lsi|lsi53c810|virtio-scsi-pci|virtio-scsi-single|megasas|pvscsi',
+    'ostype': r'other|wxp|w2k|w2k3|w2k8|wvista|win7|win8|win10|win11|l24|l26|solaris',
+    # QEMU 原始参数：只许常规字符，不许 / 引号 $ ; 等——带路径的（-fw_cfg file=/…、-smbios …;s=http://…）不沿用、只告警
+    'args': r'-[A-Za-z][A-Za-z0-9 =,._:+-]{0,255}',
 }
+
+# 「旧模板有、新模板没有」时不必告警的键：磁盘、网卡（及其 cloud-init ipconfig）、元数据、构建自己会设的硬件键
+_UNCARRIED_IGNORE_RE = re.compile(r'(?:ide|sata|scsi|virtio|unused|net|ipconfig)\d+|efidisk0|tpmstate0')
+_UNCARRIED_IGNORE = {'name', 'description', 'tags', 'template', 'digest', 'meta', 'vmgenid', 'smbios1', 'lock', 'parent',
+                     'snaptime', 'protection', 'runningmachine', 'runningcpu', 'memory', 'cores', 'cpu', 'boot',
+                     'bootdisk', 'agent', 'serial0', 'ciuser', 'bios'}
 
 
 def carry_over(cfg: dict) -> dict:
@@ -712,6 +891,70 @@ def carry_over(cfg: dict) -> dict:
         if value and re.fullmatch(rx, value):
             out[key] = value
     return out
+
+
+def uncarried_keys(old_cfg: dict, new_cfg: dict) -> list:
+    """旧模板有、新模板没有的非磁盘 / 非网卡 / 非元数据键（沿用白名单之外的、或值没通过校验的），给结果行告警用。"""
+    return sorted(k for k in old_cfg
+                  if k not in new_cfg and k not in _UNCARRIED_IGNORE and not _UNCARRIED_IGNORE_RE.fullmatch(k))
+
+
+# x86-64 微架构级别（/proc/cpuinfo 的 flags 名）：EL10 起要求 v3，没有 AVX2 的宿主机开不了机（内核直接 panic）
+CPU_LEVEL_FLAGS = {
+    2: {'cx16', 'lahf_lm', 'popcnt', 'sse4_1', 'sse4_2', 'ssse3'},
+    3: {'avx', 'avx2', 'bmi1', 'bmi2', 'f16c', 'fma', 'abm', 'movbe', 'xsave'},
+    4: {'avx512f', 'avx512bw', 'avx512cd', 'avx512dq', 'avx512vl'},
+}
+
+
+def host_cpu_level(path: Optional[str] = None) -> Optional[int]:
+    """宿主机的 x86-64 级别（1-4）；读不到 flags（非 x86 / 没有 /proc）返回 None。"""
+    flags = set()
+    with contextlib.suppress(OSError):
+        with open(path or CPUINFO, 'r', errors='replace') as fh:
+            for line in fh:
+                if line.startswith('flags'):
+                    flags = set(line.split(':', 1)[1].split())
+                    break
+    if not flags:
+        return None
+    level, need = 1, set()
+    for lv in (2, 3, 4):
+        need |= CPU_LEVEL_FLAGS[lv]
+        if not need <= flags:
+            break
+        level = lv
+    return level
+
+
+def cpu_model_ok(cpu: str, level: int) -> bool:
+    """模板的 cpu 设置能不能跑要求 x86-64-v<level> 的系统：host / max / x86-64-vN（N >= level）才算。"""
+    model = str(cpu or '').split(',', 1)[0].strip()
+    if model.startswith('cputype='):
+        model = model[len('cputype='):]
+    if model in ('host', 'max'):
+        return True
+    m = re.fullmatch(r'x86-64-v(\d)(?:-AES)?', model)
+    return bool(m) and int(m.group(1)) >= int(level)
+
+
+def mem_available_mb(path: Optional[str] = None) -> Optional[int]:
+    """/proc/meminfo 的 MemAvailable（MiB）；读不到返回 None。"""
+    with contextlib.suppress(OSError, ValueError):
+        with open(path or MEMINFO, 'r') as fh:
+            for line in fh:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) // 1024
+    return None
+
+
+def ensure_memory(min_mb: int):
+    """可用内存不够就推迟（libguestfs appliance + 冒烟 VM 各要 1 GiB；宿主机上还跑着客户 VM，OOM killer 不认人）。"""
+    if not min_mb or int(min_mb) <= 0:
+        return
+    avail = mem_available_mb()
+    if avail is not None and avail < int(min_mb):
+        raise Deferred('low memory: %d MiB available, need %d MiB (MIN_FREE_MEM_MB)' % (avail, int(min_mb)))
 
 
 def inspect_image(path: str) -> str:
@@ -734,6 +977,12 @@ def free_bytes(path: str) -> int:
     return st.f_bavail * st.f_frsize
 
 
+def fs_space(path: str) -> tuple:
+    """(可用字节, 总字节)。"""
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize, st.f_blocks * st.f_frsize
+
+
 def image_sizes(path: str) -> tuple:
     """(virtual, actual) 字节数；qemu-img 不可用时退回文件大小。"""
     actual = os.path.getsize(path)
@@ -743,14 +992,101 @@ def image_sizes(path: str) -> tuple:
     return actual, actual
 
 
-def storage_avail(node: str, storage: str) -> Optional[int]:
+def storage_status(node: str, storage: str) -> Optional[dict]:
+    """/nodes/<node>/storage/<id>/status（total / avail / used / type …）；查不到返回 None。"""
     with contextlib.suppress(PitError, ValueError, TypeError):
         st = pvesh_json('/nodes/%s/storage/%s/status' % (node, storage))
-        if isinstance(st, dict) and st.get('avail') is not None:
+        if isinstance(st, dict):
+            return st
+    return None
+
+
+def storage_avail(node: str, storage: str) -> Optional[int]:
+    st = storage_status(node, storage)
+    with contextlib.suppress(ValueError, TypeError):
+        if st and st.get('avail') is not None:
             return int(st['avail'])
     return None
 
 
-def ensure_space(what: str, avail: Optional[int], needed: int):
-    if avail is not None and avail < needed:
-        raise PitError('insufficient space on %s: %.1f GiB free, need %.1f GiB' % (what, avail / GIB, needed / GIB))
+def reserve_bytes(total: Optional[int], minimum: int, percent: int) -> int:
+    return max(int(minimum), int(total or 0) * int(percent) // 100)
+
+
+def ensure_space(what: str, avail: Optional[int], needed: int, total: Optional[int] = None, reserve: int = 0):
+    """写入 needed 字节后至少还剩 reserve；不够抛 SpaceError（= 推迟，不算失败）。avail 为 None（查不到）不拦。"""
+    if avail is not None and avail - needed < reserve:
+        raise SpaceError('not enough space: %s has %.1f GiB free, needs %.1f GiB + %.1f GiB reserve'
+                         % (what, avail / GIB, needed / GIB, reserve / GIB))
+
+
+def ensure_fs_space(what: str, path: str, needed: int):
+    """缓存 / 工作目录所在文件系统：写入后至少剩 max(10 GiB, 10%)。"""
+    avail, total = fs_space(path)
+    ensure_space(what, avail, needed, total, reserve_bytes(total, *CACHE_RESERVE))
+
+
+def thin_pool_metadata_percent(vg: str, pool: str) -> Optional[float]:
+    if not (re.fullmatch(r'[A-Za-z0-9+_.-]+', str(vg)) and re.fullmatch(r'[A-Za-z0-9+_.-]+', str(pool))):
+        return None
+    with contextlib.suppress(PitError, ValueError, IndexError):
+        out = run_cmd(['lvs', '--noheadings', '-o', 'metadata_percent', '%s/%s' % (vg, pool)], timeout=60)
+        return float(out.strip().split()[0].replace(',', '.'))
+    return None
+
+
+def ensure_storage_space(node: str, storage: str, needed: int):
+    """目标存储：写入后至少剩 max(20 GiB, 10%)；lvmthin 另看 thin pool 元数据，>= 80% 不再写。"""
+    st = storage_status(node, storage)
+    with contextlib.suppress(ValueError, TypeError):
+        if st and st.get('avail') is not None:
+            total = int(st.get('total') or 0)
+            ensure_space('storage %s' % storage, int(st['avail']), needed, total, reserve_bytes(total, *STORAGE_RESERVE))
+    cfg = storage_config(storage)
+    if cfg and cfg.get('type') == 'lvmthin' and cfg.get('vgname') and cfg.get('thinpool'):
+        pct = thin_pool_metadata_percent(cfg['vgname'], cfg['thinpool'])
+        if pct is not None and pct >= THIN_META_MAX_PERCENT:
+            raise SpaceError('not enough space: thin pool %s/%s metadata is %.1f%% full (limit %d%%)'
+                             % (cfg['vgname'], cfg['thinpool'], pct, THIN_META_MAX_PERCENT))
+
+
+# ---------------------------------------------------------------- 存储上的残留卷
+
+def storage_volumes(storage: str, vmid: int) -> Optional[set]:
+    """`pvesm list <storage> --vmid <id>` 的卷 ID 集合；查不到返回 None（= 不知道，调用方不能据此删任何东西）。"""
+    try:
+        out = run_cmd(['pvesm', 'list', storage, '--vmid', int(vmid)], timeout=120)
+    except PitError:
+        return None
+    vols = set()
+    for line in out.splitlines():
+        tok = line.split()
+        if tok and tok[0] != 'Volid' and ':' in tok[0]:
+            vols.add(tok[0])
+    return vols
+
+
+def own_volume(volid: str, vmid: int) -> bool:
+    """卷名（链接克隆取最后一段）是 vm-<id>-* / base-<id>-*。"""
+    name = volid.split(':', 1)[1] if ':' in volid else volid
+    last = name.rstrip('/').rsplit('/', 1)[-1]
+    return bool(re.fullmatch(r'(?:vm|base)-%d-[A-Za-z0-9._-]+' % int(vmid), last))
+
+
+def free_leftover_volumes(storage: str, vmid: int, before: Optional[set], log=None) -> list:
+    """失败清理（qm destroy）之后还留在存储上的卷：只删这次才出现的（不在 before 快照里）、名字是 vm-<id>-* /
+    base-<id>-* 的。before 为 None（建之前没查到）就什么都不删——没组集群却共挂存储的节点上，同号的卷可能是别家的。"""
+    if before is None:
+        return []
+    after = storage_volumes(storage, vmid)
+    freed = []
+    for volid in sorted((after or set()) - before):
+        if not own_volume(volid, vmid):
+            continue
+        try:
+            run_cmd(['pvesm', 'free', volid], timeout=600, log=log)
+            freed.append(volid)
+        except PitError as e:
+            if log:
+                log('Warning: could not free leftover volume %s: %s' % (volid, e))
+    return freed

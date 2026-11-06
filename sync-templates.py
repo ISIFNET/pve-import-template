@@ -256,7 +256,7 @@ def failure_kind(exc: BaseException) -> str:
         return str(kind)
     if isinstance(exc, pitlib.LaunchError):
         return 'appliance'
-    if 'insufficient space' in str(exc):
+    if 'insufficient space' in str(exc) or 'not enough space' in str(exc):
         return 'space'
     if 'smoke test failed' in str(exc):
         return 'smoke'

@@ -77,8 +77,9 @@ class RetiredAndGcTest(unittest.TestCase):
         self.assertFalse(pitlib.is_eol({'eol': '2027-05-31'}, today='2026-11-05'))
 
     def test_carry_over_only_whitelisted_policy_keys(self):
-        cfg = {'hookscript': 'local:snippets/hook.sh', 'vga': 'serial0', 'machine': 'q35', 'args': '-evil',
-               'net0': 'virtio,bridge=vmbr0'}
+        # args 2.2.0 起沿用，但只收不带路径 / 引号 / shell 元字符的值：-fw_cfg file=/etc/shadow 之类原样丢弃
+        cfg = {'hookscript': 'local:snippets/hook.sh', 'vga': 'serial0', 'machine': 'q35',
+               'args': '-fw_cfg name=opt/x,file=/etc/shadow', 'net0': 'virtio,bridge=vmbr0', 'protection': '1'}
         self.assertEqual(pitlib.carry_over(cfg), {'hookscript': 'local:snippets/hook.sh', 'vga': 'serial0', 'machine': 'q35'})
         self.assertEqual(pitlib.carry_over({'hookscript': 'local:snippets/../../etc/x;rm'}), {})
 
@@ -280,7 +281,7 @@ class ImportPipelineTest(unittest.TestCase):
 
     def test_customization_order(self):
         tpl = {'name': 'rocky-9', 'customize': {'run': ['./uploads/install-qga.sh']}}
-        args = imp.customization_args(tpl, {'rhel': {'url': 'http://m/centos'}}, True, True, '/tmp/info')
+        args = imp.customization_args(tpl, {'rocky': {'url': 'http://m/rockylinux'}}, True, True, '/tmp/info')
         runs = [args[i + 1] for i, a in enumerate(args) if a == '--run']
         self.assertTrue(runs[0].startswith(tempfile.gettempdir()) or 'mirror_setup_' in runs[0])
         self.assertEqual(os.path.basename(runs[1]), 'upgrade-packages.sh')
@@ -326,3 +327,344 @@ class ImportPipelineTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ClusterAndCursorTest(unittest.TestCase):
+    def test_quorum(self):
+        def status(entries):
+            return mock.patch.object(pitlib, 'pvesh_json', return_value=entries)
+        with status([{'type': 'cluster', 'name': 'c', 'quorate': 0}, {'type': 'node', 'name': 'pve1'}]):
+            self.assertIs(pitlib.cluster_quorate(), False)
+        with status([{'type': 'cluster', 'quorate': 1}]):
+            self.assertIs(pitlib.cluster_quorate(), True)
+        with status([{'type': 'node', 'name': 'pve1', 'online': 1}]):     # 单机：没有 cluster 条目
+            self.assertIsNone(pitlib.cluster_quorate())
+        with mock.patch.object(pitlib, 'pvesh_json', side_effect=pitlib.CommandError('x')):
+            self.assertIsNone(pitlib.cluster_quorate())
+
+    def test_shared_high_water_roundtrip_and_garbage(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, 'pit-vmid-hw')
+            self.assertEqual(pitlib.read_shared_high_water(path), 0)
+            self.assertTrue(pitlib.write_shared_high_water(9123, path))
+            self.assertEqual(pitlib.read_shared_high_water(path), 9123)
+            self.assertEqual(pitlib.combined_high_water(9100, 9001, 9999, path), 9123)
+            self.assertEqual(pitlib.combined_high_water(9200, 9001, 9999, path), 9200)
+            # 别的节点配了别的区间：它的游标不算
+            pitlib.write_shared_high_water(100500, path)
+            self.assertEqual(pitlib.combined_high_water(9100, 9001, 9999, path), 9100)
+            with open(path, 'w') as fh:
+                fh.write('rm -rf /\n')
+            self.assertEqual(pitlib.read_shared_high_water(path), 0)
+            self.assertFalse(pitlib.write_shared_high_water(9001, os.path.join(d, 'missing', 'x')))
+
+
+class GuestExecTest(unittest.TestCase):
+    def test_parse_guest_exec(self):
+        out = 'warning: something\n{\n   "exitcode" : 2,\n   "exited" : 1,\n   "out-data" : "status: done\\n"\n}\n'
+        self.assertEqual(pitlib.parse_guest_exec(out), {'exitcode': 2, 'exited': True, 'out': 'status: done\n', 'err': ''})
+        self.assertIsNone(pitlib.parse_guest_exec('Agent error: boom'))
+        self.assertIsNone(pitlib.parse_guest_exec('{"pid": 12}'))
+
+    def test_guest_exec_errors_are_classified(self):
+        def failing(output):
+            return mock.patch.object(pitlib, 'run_cmd', side_effect=pitlib.CommandError('qm failed', 255, output))
+        with failing("Agent error: The command guest-exec has been disabled for this instance"):
+            with self.assertRaises(pitlib.GuestExecUnsupported):
+                pitlib.guest_exec(9999, ['cloud-init', 'status'])
+        with failing("Agent error: The command guest-exec has not been found"):
+            with self.assertRaises(pitlib.GuestExecUnsupported):
+                pitlib.guest_exec(9999, ['true'])
+        with failing("Agent error: Guest agent command failed, error was 'Failed to execute child process "
+                     "“cloud-init” (No such file or directory)'"):
+            with self.assertRaises(pitlib.GuestCommandMissing):
+                pitlib.guest_exec(9999, ['cloud-init', 'status'])
+        with failing('{"exitcode": 1, "exited": 1, "out-data": "status: error"}'):
+            self.assertEqual(pitlib.guest_exec(9999, ['cloud-init', 'status'])['exitcode'], 1)
+        with mock.patch.object(pitlib, 'run_cmd', return_value='{"exitcode": 0, "exited": 1}') as rc:
+            pitlib.guest_exec(9999, ['sh', '-c', 'echo; rm -rf /'])
+        argv = [str(a) for a in rc.call_args.args[0]]
+        # 来宾命令作为独立 argv 传给 qm（不经宿主机 shell），放在 -- 之后
+        self.assertEqual(argv[:7], ['qm', 'guest', 'exec', '9999', '--timeout', '30', '--'])
+        self.assertEqual(argv[7:], ['sh', '-c', 'echo; rm -rf /'])
+
+
+class HostResourcesTest(unittest.TestCase):
+    V2 = 'fpu lm cmov cx8 sse sse2 cx16 lahf_lm popcnt sse4_1 sse4_2 ssse3'
+    V3 = V2 + ' avx avx2 bmi1 bmi2 f16c fma abm movbe xsave'
+    V4 = V3 + ' avx512f avx512bw avx512cd avx512dq avx512vl'
+
+    def cpuinfo(self, flags):
+        fd, path = tempfile.mkstemp()
+        with os.fdopen(fd, 'w') as fh:
+            fh.write('processor\t: 0\nvendor_id\t: GenuineIntel\nflags\t\t: %s\n\nprocessor\t: 1\n' % flags)
+        self.addCleanup(os.remove, path)
+        return path
+
+    def test_host_cpu_level(self):
+        self.assertEqual(pitlib.host_cpu_level(self.cpuinfo('fpu lm sse sse2')), 1)
+        self.assertEqual(pitlib.host_cpu_level(self.cpuinfo(self.V2)), 2)
+        self.assertEqual(pitlib.host_cpu_level(self.cpuinfo(self.V3)), 3)
+        self.assertEqual(pitlib.host_cpu_level(self.cpuinfo(self.V4)), 4)
+        self.assertEqual(pitlib.host_cpu_level(self.cpuinfo(self.V3.replace(' avx2', ''))), 2)   # 没 AVX2 = 不到 v3
+        self.assertIsNone(pitlib.host_cpu_level('/nonexistent/cpuinfo'))
+
+    def test_cpu_model_ok(self):
+        for ok in ('host', 'host,flags=+aes', 'max', 'x86-64-v3', 'x86-64-v4', 'cputype=x86-64-v3,flags=+aes'):
+            self.assertTrue(pitlib.cpu_model_ok(ok, 3), ok)
+        for bad in ('kvm64', 'x86-64-v2-AES', 'qemu64', 'Haswell', ''):
+            self.assertFalse(pitlib.cpu_model_ok(bad, 3), bad)
+        self.assertTrue(pitlib.cpu_model_ok('x86-64-v2-AES', 2))
+
+    def test_memory(self):
+        fd, path = tempfile.mkstemp()
+        with os.fdopen(fd, 'w') as fh:
+            fh.write('MemTotal:       65536000 kB\nMemFree:  100 kB\nMemAvailable:    2097152 kB\n')
+        self.addCleanup(os.remove, path)
+        self.assertEqual(pitlib.mem_available_mb(path), 2048)
+        self.assertIsNone(pitlib.mem_available_mb('/nonexistent'))
+        with mock.patch.object(pitlib, 'MEMINFO', path):
+            pitlib.ensure_memory(2048)
+            pitlib.ensure_memory(0)
+            with self.assertRaises(pitlib.Deferred) as ctx:
+                pitlib.ensure_memory(4096)
+        self.assertTrue(str(ctx.exception).startswith('low memory: 2048 MiB available, need 4096 MiB'))
+
+
+class SpaceTest(unittest.TestCase):
+    def test_ensure_space_reserve_is_a_deferral(self):
+        pitlib.ensure_space('x', None, 10)                         # 查不到不拦
+        pitlib.ensure_space('x', 30 * pitlib.GIB, 5 * pitlib.GIB, reserve=20 * pitlib.GIB)
+        with self.assertRaises(pitlib.SpaceError) as ctx:
+            pitlib.ensure_space('storage tank', 24 * pitlib.GIB, 5 * pitlib.GIB, reserve=20 * pitlib.GIB)
+        self.assertIsInstance(ctx.exception, pitlib.Deferred)
+        self.assertTrue(str(ctx.exception).startswith('not enough space: storage tank has 24.0 GiB free'))
+
+    def test_reserves(self):
+        self.assertEqual(pitlib.reserve_bytes(100 * pitlib.GIB, *pitlib.CACHE_RESERVE), 10 * pitlib.GIB)
+        self.assertEqual(pitlib.reserve_bytes(500 * pitlib.GIB, *pitlib.CACHE_RESERVE), 50 * pitlib.GIB)
+        self.assertEqual(pitlib.reserve_bytes(100 * pitlib.GIB, *pitlib.STORAGE_RESERVE), 20 * pitlib.GIB)
+        self.assertEqual(pitlib.reserve_bytes(2000 * pitlib.GIB, *pitlib.STORAGE_RESERVE), 200 * pitlib.GIB)
+        with mock.patch.object(pitlib, 'fs_space', return_value=(15 * pitlib.GIB, 100 * pitlib.GIB)):
+            pitlib.ensure_fs_space('cache', '/x', 4 * pitlib.GIB)
+            with self.assertRaises(pitlib.SpaceError):
+                pitlib.ensure_fs_space('cache', '/x', 6 * pitlib.GIB)
+
+    def test_storage_space_and_thin_metadata(self):
+        status = {'total': 100 * pitlib.GIB, 'avail': 25 * pitlib.GIB}
+        cfg = {'type': 'lvmthin', 'vgname': 'pve', 'thinpool': 'data', 'content': 'images,rootdir'}
+        lvs = []
+
+        def run_cmd(argv, **kw):
+            lvs.append([str(a) for a in argv])
+            return '  %s\n' % meta_pct
+        with mock.patch.object(pitlib, 'storage_status', return_value=status), \
+                mock.patch.object(pitlib, 'storage_config', return_value=cfg), \
+                mock.patch.object(pitlib, 'run_cmd', side_effect=run_cmd):
+            meta_pct = '42.10'
+            pitlib.ensure_storage_space('pve1', 'local-lvm', 4 * pitlib.GIB)
+            self.assertEqual(lvs[-1], ['lvs', '--noheadings', '-o', 'metadata_percent', 'pve/data'])
+            with self.assertRaises(pitlib.SpaceError):          # 25 - 6 < 20 GiB 保留
+                pitlib.ensure_storage_space('pve1', 'local-lvm', 6 * pitlib.GIB)
+            meta_pct = '80.00'
+            with self.assertRaises(pitlib.SpaceError) as ctx:
+                pitlib.ensure_storage_space('pve1', 'local-lvm', 0)
+            self.assertIn('thin pool pve/data metadata is 80.0% full', str(ctx.exception))
+
+    def test_storage_template_problem(self):
+        def cfg(c):
+            return mock.patch.object(pitlib, 'storage_config', return_value=c)
+        with cfg({'type': 'lvm', 'content': 'images'}):
+            self.assertIn('type lvm', pitlib.storage_template_problem('vg0'))
+        with cfg({'type': 'iscsidirect', 'content': 'images'}):
+            self.assertIn('cannot hold VM templates', pitlib.storage_template_problem('san'))
+        with cfg({'type': 'dir', 'content': 'iso,backup'}):
+            self.assertIn('does not allow VM images', pitlib.storage_template_problem('local'))
+        with cfg({'type': 'lvmthin', 'content': 'images,rootdir'}):
+            self.assertIsNone(pitlib.storage_template_problem('local-lvm'))
+        with cfg(None):
+            self.assertIsNone(pitlib.storage_template_problem('unknown'))
+
+
+class LeftoverVolumeTest(unittest.TestCase):
+    LIST = ('Volid                         Format  Type      Size VMID\n'
+            'local-lvm:vm-9050-disk-0      raw     images    1024 9050\n'
+            'local-lvm:base-9042-disk-0/vm-9050-disk-1 raw images 1024 9050\n'
+            'local-lvm:vm-90500-disk-0     raw     images    1024 90500\n')
+
+    def test_storage_volumes_and_own_volume(self):
+        with mock.patch.object(pitlib, 'run_cmd', return_value=self.LIST):
+            vols = pitlib.storage_volumes('local-lvm', 9050)
+        self.assertIn('local-lvm:vm-9050-disk-0', vols)
+        self.assertTrue(pitlib.own_volume('local-lvm:vm-9050-disk-0', 9050))
+        self.assertTrue(pitlib.own_volume('local-lvm:base-9042-disk-0/vm-9050-disk-1', 9050))
+        self.assertTrue(pitlib.own_volume('local:9050/vm-9050-cloudinit.qcow2', 9050))
+        self.assertFalse(pitlib.own_volume('local-lvm:vm-90500-disk-0', 9050))
+        self.assertFalse(pitlib.own_volume('local-lvm:base-9042-disk-0', 9050))
+        with mock.patch.object(pitlib, 'run_cmd', side_effect=pitlib.CommandError('storage down')):
+            self.assertIsNone(pitlib.storage_volumes('local-lvm', 9050))
+
+    def test_free_leftover_volumes_only_frees_new_own_volumes(self):
+        calls = []
+
+        def run_cmd(argv, **kw):
+            argv = [str(a) for a in argv]
+            calls.append(argv)
+            return self.LIST if argv[:2] == ['pvesm', 'list'] else ''
+        with mock.patch.object(pitlib, 'run_cmd', side_effect=run_cmd):
+            freed = pitlib.free_leftover_volumes('local-lvm', 9050, {'local-lvm:vm-9050-disk-0'})
+            self.assertEqual(freed, ['local-lvm:base-9042-disk-0/vm-9050-disk-1'])
+            self.assertEqual([c for c in calls if c[:2] == ['pvesm', 'free']],
+                             [['pvesm', 'free', 'local-lvm:base-9042-disk-0/vm-9050-disk-1']])
+            calls.clear()
+            # 建之前没查到（None）= 不知道哪些是别人的：一个都不删
+            self.assertEqual(pitlib.free_leftover_volumes('local-lvm', 9050, None), [])
+            self.assertEqual(calls, [])
+
+
+class CarryOverV22Test(unittest.TestCase):
+    def test_new_policy_keys(self):
+        cfg = {'nameserver': '1.1.1.1 2606:4700::1111', 'searchdomain': 'example.com corp.local',
+               'cicustom': 'user=local:snippets/user.yaml,network=local:snippets/net.yaml', 'ciupgrade': '0',
+               'numa': '1', 'tablet': '0', 'rng0': 'source=/dev/urandom,max_bytes=1024,period=1000',
+               'scsihw': 'virtio-scsi-pci', 'ostype': 'l26', 'args': '-cpu host,+kvm_pv_unhalt',
+               'protection': '1', 'onboot': '1'}
+        out = pitlib.carry_over(cfg)
+        self.assertEqual(set(out), {'nameserver', 'searchdomain', 'cicustom', 'ciupgrade', 'numa', 'tablet', 'rng0',
+                                    'scsihw', 'ostype', 'args'})
+        for key, bad in (('nameserver', '1.1.1.1;reboot'), ('cicustom', 'user=local:snippets/a.yaml,x=/etc/shadow'),
+                         ('rng0', 'source=/etc/shadow'), ('scsihw', 'evil'), ('args', "-drive file='/dev/sda'"),
+                         ('args', 'no-leading-dash')):
+            self.assertNotIn(key, pitlib.carry_over({key: bad}), bad)
+
+    def test_uncarried_keys_ignore_disks_nics_and_metadata(self):
+        old = {'scsi0': 'x', 'ide2': 'x', 'net0': 'x', 'net1': 'x', 'ipconfig0': 'ip=dhcp', 'efidisk0': 'x', 'unused0': 'x',
+               'name': 'n', 'description': 'd', 'tags': 't', 'digest': 'x', 'smbios1': 'uuid=1', 'vmgenid': 'x',
+               'memory': '512', 'cores': '1', 'cpu': 'host', 'protection': '1', 'hookscript': 'local:snippets/h.sh',
+               'sockets': '2', 'sshkeys': 'x', 'hostpci0': '01:00.0', 'args': '-fw_cfg file=/x'}
+        new = {'scsi0': 'y', 'hookscript': 'local:snippets/h.sh'}
+        self.assertEqual(pitlib.uncarried_keys(old, new), ['args', 'hostpci0', 'sockets', 'sshkeys'])
+
+
+class VirtCustomizeEnvTest(unittest.TestCase):
+    def test_libguestfs_memsize(self):
+        with mock.patch.object(pitlib, 'run_cmd', return_value='') as rc, mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('LIBGUESTFS_MEMSIZE', None)
+            pitlib.run_virt_customize('/x.img', ['--run', '/s.sh'])
+            self.assertEqual(rc.call_args.kwargs['env']['LIBGUESTFS_MEMSIZE'], '1024')
+            os.environ['LIBGUESTFS_MEMSIZE'] = '2048'      # 运维显式设了：不覆盖（run_cmd 会继承环境）
+            pitlib.run_virt_customize('/x.img', ['--run', '/s.sh'])
+            self.assertNotIn('LIBGUESTFS_MEMSIZE', rc.call_args.kwargs['env'])
+
+
+class RecipeAndYamlV22Test(unittest.TestCase):
+    def test_metadata_keys_do_not_change_the_recipe(self):
+        # min_cpu_level / display_name 跟 eol 一样是元数据：加上它们不能触发全机队重建
+        tpl = {'name': 'rocky-10', 'url': 'https://r/10.qcow2', 'cloud_init': True}
+        base = imp.recipe_of(tpl, True, True, None)
+        self.assertEqual(imp.recipe_of({**tpl, 'min_cpu_level': 3}, True, True, None), base)
+        self.assertEqual(imp.recipe_of({**tpl, 'display_name': 'Rocky Linux 10'}, True, True, None), base)
+
+    def test_el10_templates_require_x86_64_v3(self):
+        cfg = imp.load_config()
+        levels = {t['name']: t.get('min_cpu_level') for t in cfg['templates']}
+        for name in ('rocky-10', 'almaLinux-10', 'centos-stream-10'):
+            self.assertEqual(levels[name], 3, name)
+        self.assertIsNone(levels['rocky-9'])
+
+
+class MirrorScriptTest(unittest.TestCase):
+    """生成的换源脚本对着真实格式的 repo 文件跑一遍（只把 /etc/yum.repos.d 换成临时目录）。"""
+
+    ROCKY = ('[baseos]\nname=Rocky Linux $releasever - BaseOS\n'
+             'mirrorlist=https://mirrors.rockylinux.org/mirrorlist?arch=$basearch&repo=BaseOS-$releasever$rltype\n'
+             '#baseurl=http://dl.rockylinux.org/$contentdir/$releasever/BaseOS/$basearch/os/\ngpgcheck=1\nenabled=1\n')
+    ALMA = ('[baseos]\nname=AlmaLinux $releasever - BaseOS\n'
+            'mirrorlist=https://mirrors.almalinux.org/mirrorlist/$releasever/baseos\n'
+            '# baseurl=https://repo.almalinux.org/almalinux/$releasever/BaseOS/$basearch/os/\nenabled=1\n')
+    STREAM = ('[baseos]\nname=CentOS Stream $releasever - BaseOS\n'
+              'metalink=https://mirrors.centos.org/metalink?repo=centos-baseos-$stream&arch=$basearch&protocol=https,http\n'
+              'enabled=1\n\n[baseos-debug]\n'
+              'metalink=https://mirrors.centos.org/metalink?repo=centos-baseos-debug-$stream&arch=$basearch&protocol=https,http\n'
+              'enabled=0\n\n[crb]\n'
+              'metalink=https://mirrors.centos.org/metalink?repo=centos-crb-$stream&arch=$basearch&protocol=https,http\n'
+              'enabled=0\n\n[extras-common]\n'
+              'metalink=https://mirrors.centos.org/metalink?repo=centos-extras-sig-extras-common-$stream&arch=$basearch\n')
+
+    def run_script(self, family, url, repo_text):
+        script = imp.build_mirror_command({family: {'url': url}}, family)
+        with tempfile.TemporaryDirectory() as d:
+            repo = os.path.join(d, 'x.repo')
+            with open(repo, 'w') as fh:
+                fh.write(repo_text)
+            path = os.path.join(d, 'mirror.sh')
+            with open(path, 'w') as fh:
+                fh.write(script.replace('/etc/yum.repos.d', d))
+            import subprocess
+            subprocess.run(['sh', path], check=True)
+            with open(repo) as fh:
+                return fh.read()
+
+    def test_rocky_uses_its_own_mirror_path(self):
+        out = self.run_script('rocky', 'https://mirrors.example/rockylinux', self.ROCKY)
+        self.assertIn('\nbaseurl=https://mirrors.example/rockylinux/$releasever/BaseOS/$basearch/os/\n', out)
+        self.assertIn('#mirrorlist=', out)
+        self.assertNotIn('centos', out)
+
+    def test_alma_uses_its_own_mirror_path(self):
+        out = self.run_script('almalinux', 'https://mirrors.example/almalinux', self.ALMA)
+        self.assertIn('\nbaseurl=https://mirrors.example/almalinux/$releasever/BaseOS/$basearch/os/\n', out)
+        self.assertIn('#mirrorlist=', out)
+
+    def test_centos_stream_metalink_becomes_baseurl(self):
+        out = self.run_script('centos-stream', 'https://mirrors.example/centos-stream', self.STREAM)
+        self.assertIn('\nbaseurl=https://mirrors.example/centos-stream/$stream/BaseOS/$basearch/os/\n', out)
+        self.assertIn('\nbaseurl=https://mirrors.example/centos-stream/$stream/CRB/$basearch/os/\n', out)
+        self.assertIn('\nbaseurl=https://mirrors.example/centos-stream/SIGs/$stream/extras/$basearch/extras-common/\n', out)
+        self.assertIn('repo=centos-baseos-debug-$stream', out)    # 认不出的（debug）原样保留
+
+    def test_rocky_and_alma_never_fall_back_to_the_centos_path(self):
+        legacy = {'rhel': {'url': 'http://m/centos'}}
+        with mock.patch('sys.stderr'):
+            self.assertEqual(imp.build_mirror_args(legacy, 'rocky-9'), [])
+            self.assertEqual(imp.build_mirror_args(legacy, 'almaLinux-9'), [])
+            self.assertEqual(imp.build_mirror_args(legacy, 'centos-stream-10'), [])
+        self.assertEqual(imp.detect_rhel_variant('centos-stream-9'), 'centos-stream')
+        args = imp.build_mirror_args({'rocky': {'url': 'http://m/rocky'}}, 'rocky-9')
+        with open(args[1]) as fh:
+            self.assertIn('baseurl=http://m/rocky', fh.read())
+        imp.cleanup_temp_files()
+
+    def test_shipped_mirrors_have_per_distro_el_entries(self):
+        mirrors = imp.load_config()['mirrors']
+        for name in ('aliyun', 'tsinghua', 'tencent', 'ustc'):
+            for key in ('rocky', 'almalinux', 'centos-stream'):
+                self.assertIn(key, mirrors[name], '%s lacks %s' % (name, key))
+                self.assertNotRegex(mirrors[name][key]['url'], r'/centos$')
+
+
+class FetchImageTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for p in (mock.patch.object(imp, 'CACHE_DIR', self.tmp.name),
+                  mock.patch.object(pitlib, 'http_head', return_value={'length': '100'}),
+                  mock.patch.object(pitlib, 'fs_space', return_value=(500 * pitlib.GIB, 1000 * pitlib.GIB))):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_interrupted_download_leaves_no_partial_file(self):
+        def download_any(name, urls, dest):
+            with open(dest, 'wb') as fh:
+                fh.write(b'half')
+            raise KeyboardInterrupt
+        with mock.patch.object(imp, 'download_any', side_effect=download_any):
+            with self.assertRaises(KeyboardInterrupt):
+                imp.fetch_image({'name': 'debian-13', 'url': 'https://d/13'}, url='https://d/13', config={})
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, 'debian-13.img.download')))
+
+    def test_space_shortage_is_a_deferral_not_a_download_failure(self):
+        with mock.patch.object(pitlib, 'fs_space', return_value=(11 * pitlib.GIB, 100 * pitlib.GIB)), \
+                mock.patch.object(pitlib, 'http_head', return_value={'length': str(2 * pitlib.GIB)}):
+            with self.assertRaises(pitlib.SpaceError):
+                imp.fetch_image({'name': 'debian-13', 'url': 'https://d/13'}, url='https://d/13', config={})

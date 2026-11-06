@@ -70,6 +70,9 @@ with open(os.path.join(SCRIPT_DIR, 'VERSION'), 'r') as _fh:
 # 进配方指纹的「构建流程版本」：只在构建步骤 / 注入方式变了时手动加一。不用 TOOL_VERSION——改个文档发版也会让
 # 全机队所有模板判 recipe-changed、排着队重建（2026-11-05 审查）
 RECIPE_VERSION = '2'
+# yaml 条目里不进配方指纹的键：eol（支持期）、display_name（平台显示名）、min_cpu_level（宿主机 CPU 要求）都是元数据，
+# 不影响镜像内容
+RECIPE_IGNORED_KEYS = ('eol', 'display_name', 'min_cpu_level')
 
 
 # 网络/内核 sysctl 调优脚本（import 与 update-templates.py 共用，单一数据源）
@@ -337,6 +340,18 @@ def detect_os_family(template_name: str) -> Optional[str]:
     return None
 
 
+def detect_rhel_variant(template_name: str) -> str:
+    """EL 系模板的发行版：rocky / almalinux / centos-stream；认不出返回 rhel（走通用换源规则）。"""
+    name_lower = template_name.lower()
+    if 'rocky' in name_lower:
+        return 'rocky'
+    if 'alma' in name_lower:
+        return 'almalinux'
+    if 'centos-stream' in name_lower or 'centos' in name_lower:
+        return 'centos-stream'
+    return 'rhel'
+
+
 def build_mirror_command(mirror_config: dict, os_family: str) -> Optional[str]:
     """
     根据镜像源配置和操作系统类型，生成配置镜像源的 shell 命令。
@@ -421,6 +436,57 @@ done
 exit 0
 '''
 
+    elif os_family == 'rocky':
+        # Rocky：baseurl 写成「#baseurl=http://dl.rockylinux.org/$contentdir/…」（$contentdir = pub/rocky）。
+        # 镜像站的目录对应 $contentdir 这一层（如 https://mirrors.aliyun.com/rockylinux），整段替换
+        return f'''#!/bin/sh
+set -eu
+for repo in /etc/yum.repos.d/*.repo; do
+    [ -f "$repo" ] || continue
+    grep -Eq '^#[[:space:]]*baseurl=https?://dl\\.rockylinux\\.org/\\$contentdir' "$repo" || continue
+    cp "$repo" "$repo.bak"
+    sed -i -E 's@^(mirrorlist|metalink)=@#\\1=@' "$repo"
+    sed -i -E 's@^#[[:space:]]*baseurl=https?://dl\\.rockylinux\\.org/\\$contentdir@baseurl={base_url}@' "$repo"
+done
+exit 0
+'''
+
+    elif os_family == 'almalinux':
+        # AlmaLinux：「# baseurl=https://repo.almalinux.org/almalinux/$releasever/…」，镜像站目录对应 /almalinux 这一层
+        return f'''#!/bin/sh
+set -eu
+for repo in /etc/yum.repos.d/*.repo; do
+    [ -f "$repo" ] || continue
+    grep -Eq '^#[[:space:]]*baseurl=https?://repo\\.almalinux\\.org/almalinux' "$repo" || continue
+    cp "$repo" "$repo.bak"
+    sed -i -E 's@^(mirrorlist|metalink)=@#\\1=@' "$repo"
+    sed -i -E 's@^#[[:space:]]*baseurl=https?://repo\\.almalinux\\.org/almalinux@baseurl={base_url}@' "$repo"
+done
+exit 0
+'''
+
+    elif os_family == 'centos-stream':
+        # CentOS Stream 9 / 10 的 repo 文件里只有 metalink、没有 baseurl：按仓库名把 metalink 换成镜像站的 baseurl
+        # （$stream = 9-stream / 10-stream，镜像站目录对应 /centos-stream 这一层）。认不出的仓库（debug / source 等，
+        # 默认不启用）原样保留
+        repos = [('baseos', 'BaseOS'), ('appstream', 'AppStream'), ('crb', 'CRB'),
+                 ('highavailability', 'HighAvailability'), ('nfv', 'NFV'), ('rt', 'RT'),
+                 ('resilientstorage', 'ResilientStorage')]
+        seds = ''.join(
+            f"    sed -i -E 's@^metalink=https?://mirrors\\.centos\\.org/metalink\\?repo=centos-{key}-\\$stream&.*$@"
+            f"baseurl={base_url}/$stream/{path}/$basearch/os/@' \"$repo\"\n" for key, path in repos)
+        seds += (f"    sed -i -E 's@^metalink=https?://mirrors\\.centos\\.org/metalink\\?repo=centos-extras-sig-extras-common-"
+                 f"\\$stream&.*$@baseurl={base_url}/SIGs/$stream/extras/$basearch/extras-common/@' \"$repo\"\n")
+        return f'''#!/bin/sh
+set -eu
+for repo in /etc/yum.repos.d/*.repo; do
+    [ -f "$repo" ] || continue
+    grep -q '^metalink=.*mirrors\\.centos\\.org' "$repo" || continue
+    cp "$repo" "$repo.bak"
+{seds}done
+exit 0
+'''
+
     elif os_family == 'alpine':
         return f'''#!/bin/sh
 set -eu
@@ -468,6 +534,16 @@ def build_mirror_args(mirror_config: Optional[dict], template_name: str) -> list
     if not os_family:
         print(f'Warning: Cannot detect OS family for {template_name}, skipping mirror configuration.', file=sys.stderr)
         return []
+    if os_family == 'rhel':
+        # EL 系各发行版的仓库路径不同（rocky / almalinux / centos-stream 各有镜像目录）：旧版把三家都改成 rhel
+        # 的 …/centos 路径，换源后仓库 404、包升级失败。只认按发行版配置的条目；只配了旧的 rhel 不换源（保持官方源）
+        variant = detect_rhel_variant(template_name)
+        if variant != 'rhel':
+            if variant not in mirror_config:
+                print(f'Warning: mirror has no "{variant}" entry; keeping the official repositories for {template_name}.',
+                      file=sys.stderr)
+                return []
+            os_family = variant
 
     mirror_cmd = build_mirror_command(mirror_config, os_family)
     if not mirror_cmd:
@@ -706,33 +782,35 @@ def fetch_image(template: dict, refresh: bool = False, config: Optional[dict] = 
         print(f'Image for {name} {why}, skip download.', file=sys.stderr)
         return img, meta_old
 
-    # 下载 + 解包最多同时占两份；没有 Content-Length 时按 4 GiB 估
+    # 下载 + 解包最多同时占两份；没有 Content-Length 时按 4 GiB 估。写完后文件系统至少还要剩 max(10 GiB, 10%)：
+    # 不够抛 SpaceError（sync 记 deferred，不算失败、不进退避）
     length = int(head['length']) if str(head.get('length') or '').isdigit() else 2 * pitlib.GIB
+    pitlib.ensure_fs_space(f'cache dir {CACHE_DIR}', CACHE_DIR, 2 * length + pitlib.GIB // 2)
+
     try:
-        pitlib.ensure_space(f'cache dir {CACHE_DIR}', pitlib.free_bytes(CACHE_DIR), 2 * length + pitlib.GIB // 2)
-    except pitlib.PitError as e:
-        raise DownloadError(str(e), 'space') from None
+        fetched_from = download_any(name, pitlib.mirror_candidates(url, config), dl)
+        checksum = verify_download(template, url, dl, config)
+        if require_checksum and not checksum.get('verified') and (template.get('checksum') or template.get('checksum_pattern')):
+            # 无人值守构建（sync）：配了校验却核对不了就不建——产物会发给每一台新客户 VM
+            raise DownloadError(f'{name}: checksum configured but could not be verified ({checksum.get("reason")}); not building', 'checksum')
 
-    fetched_from = download_any(name, pitlib.mirror_candidates(url, config), dl)
-    checksum = verify_download(template, url, dl, config)
-    if require_checksum and not checksum.get('verified') and (template.get('checksum') or template.get('checksum_pattern')):
-        # 无人值守构建（sync）：配了校验却核对不了就不建——产物会发给每一台新客户 VM
+        unpack = template.get('unpack')
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(img)
+        if unpack:
+            # yaml 里的 unpack 是仓库作者写的固定命令模板；占位符只会是缓存路径（不含空格 / 引号）
+            cmd = unpack.replace('{dl}', dl).replace('{img}', img)
+            print(f'# {cmd}', file=sys.stderr)
+            subprocess.run(cmd, shell=True, check=True)
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(dl)
+        else:
+            os.replace(dl, img)
+    except BaseException:
+        # 失败 / Ctrl-C / SIGTERM：半截的 .img.download 动辄几 GB，不能留在缓存目录里
         with contextlib.suppress(FileNotFoundError):
             os.remove(dl)
-        raise DownloadError(f'{name}: checksum configured but could not be verified ({checksum.get("reason")}); not building', 'checksum')
-
-    unpack = template.get('unpack')
-    with contextlib.suppress(FileNotFoundError):
-        os.remove(img)
-    if unpack:
-        # yaml 里的 unpack 是仓库作者写的固定命令模板；占位符只会是缓存路径（不含空格 / 引号）
-        cmd = unpack.replace('{dl}', dl).replace('{img}', img)
-        print(f'# {cmd}', file=sys.stderr)
-        subprocess.run(cmd, shell=True, check=True)
-        with contextlib.suppress(FileNotFoundError):
-            os.remove(dl)
-    else:
-        os.replace(dl, img)
+        raise
 
     meta = {
         'url': url,
@@ -792,12 +870,31 @@ def match_templates(all_tpls: list, filter_expr: Optional[str], families: Option
     return uniq
 
 
-def destroy_vm_quietly(vmid: int):
-    """导入中途失败时清理半成品 VM（尽力而为，不抛异常）。"""
+# 清理命令的墙钟上限：卡死的 qm stop / destroy（存储挂了、锁等不到）不能让整轮 sync 一直挂着
+CLEANUP_TIMEOUT = 600
+
+
+def quiet_cmd(argv: list, timeout: int = CLEANUP_TIMEOUT) -> bool:
+    """尽力而为地跑一条清理命令（不抛异常、带超时）；成功返回 True。"""
+    try:
+        return subprocess.run([str(a) for a in argv], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              check=False, timeout=timeout).returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def destroy_vm_quietly(vmid: int, storage: Optional[str] = None, volumes_before: Optional[set] = None, log=None):
+    """导入中途失败时清理半成品 VM（尽力而为，不抛异常）。
+
+    storage + volumes_before（建之前 `pvesm list` 的快照）都给了，才在 destroy 之后再扫一遍存储，删掉这次才出现的
+    vm-<id>-* / base-<id>-* 残留卷（import-from 中途失败、cloudinit 卷没跟着走等）。
+    """
     print(f'清理未完成的 VM {vmid} ...', file=sys.stderr)
     # 不带 --destroy-unreferenced-disks：它按 VMID 扫存储上的卷，没组集群却共挂存储的节点会误删别的机器同号 VM 的盘
-    subprocess.run(['qm', 'destroy', str(vmid), '--purge', '1'],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    quiet_cmd(['qm', 'destroy', vmid, '--purge', '1', '--skiplock', '1'])
+    if storage and volumes_before is not None:
+        with contextlib.suppress(pitlib.PitError):
+            pitlib.free_leftover_volumes(storage, vmid, volumes_before, log=log)
 
 
 def upgrade_enabled(template: dict, upgrade: bool) -> bool:
@@ -820,7 +917,9 @@ def recipe_of(template: dict, apply_tuning: bool, upgrade: bool, mirror_name: Op
                         'upgrade': upgrade_enabled(template, upgrade), 'mirror': mirror_name or ''}
     tpl.pop('url', None)       # 地址变化由 source 比对负责（discover 会让 url 每个点版本都变）
     tpl.pop('discover', None)
-    tpl.pop('eol', None)       # 支持期是元数据、不影响镜像内容：改个日期不能让全机队把这个模板重建一遍
+    # 元数据、不影响镜像内容：改个日期 / 显示名 / CPU 要求不能让全机队把这个模板重建一遍
+    for key in RECIPE_IGNORED_KEYS:
+        tpl.pop(key, None)
     return pitlib.recipe_hash(tpl, files, RECIPE_VERSION)
 
 
@@ -858,28 +957,124 @@ def write_build_info(name: str, built_at: int, source: dict) -> str:
     return path
 
 
-def smoke_test(template_vmid: int, allocate, timeout: int, log, memory: int = 512) -> None:
-    """切换前的开机闸：从新模板克隆一台临时 VM（拔掉所有网卡、摘掉 hookscript），开机后 timeout 秒内 qemu-guest-agent
-    必须应答，然后销毁。包升级会在 chroot 里动内核 / initramfs / grub / extlinux；verify-image.sh 只能看文件，看不出「还能不能开机」。
+# 深度冒烟里的 SSH 检查：不同退出码区分失败项（qga exec 只回退出码与输出）
+SMOKE_SSH_SCRIPT = r'''
+ls /etc/ssh/ssh_host_*_key >/dev/null 2>&1 || { echo "no /etc/ssh/ssh_host_*_key"; exit 11; }
+SSHD=""
+for p in /usr/sbin/sshd /usr/bin/sshd /sbin/sshd; do [ -x "$p" ] && SSHD="$p" && break; done
+[ -n "$SSHD" ] || { echo "sshd binary not found"; exit 12; }
+mkdir -p /run/sshd 2>/dev/null
+"$SSHD" -t 2>&1 || exit 13
+if systemctl is-active ssh >/dev/null 2>&1 || systemctl is-active sshd >/dev/null 2>&1 \
+   || systemctl is-active ssh.socket >/dev/null 2>&1 || systemctl is-active sshd.socket >/dev/null 2>&1 \
+   || rc-service sshd status >/dev/null 2>&1; then
+  exit 0
+fi
+echo "neither ssh nor sshd (service / socket) is active"
+exit 14
+'''
+SMOKE_SSH_FAILURES = {
+    11: 'SSH host keys were not generated at first boot',
+    12: 'sshd is not installed',
+    13: 'sshd -t rejects the configuration',
+    14: 'the sshd service is not running',
+}
+SMOKE_POLL_SECONDS = 10
+SMOKE_SSH_ATTEMPTS = 3
 
-    allocate：每次调用给一个临时号（从区间顶端往下取，不推高模板的游标）。
+
+def smoke_deep_checks(vmid: int, deadline: float, log, sleep=None) -> list:
+    """qga 应答之后、仍在 SMOKE_TIMEOUT 总预算内的加深检查，返回告警列表；不达标抛 PitError（smoke test failed: …）。
+
+    1) cloud-init 跑完：`cloud-init status` 轮询到 done / disabled（done 带 degraded 也算过）；error 失败；超时还在跑也失败。
+       来宾里没有 cloud-init 就跳过这一项。
+    2) SSH 能用：host key 已生成、`sshd -t` 通过、sshd（服务或 socket）在跑。
+    qga 不支持 exec（旧 agent / 禁用了 guest-exec）：两项都跳过、记告警，不失败。
     """
+    sleep = sleep or time.sleep
+    warnings = []
+    try:
+        while True:
+            res = pitlib.guest_exec(vmid, ['cloud-init', 'status'], timeout=30)
+            text = (res['out'] + '\n' + res['err']).strip()
+            m = re.search(r'^\s*status:\s*([a-z][a-z ]*?)\s*$', text, re.M | re.I)
+            status = m.group(1).lower() if m else ''
+            if status in ('done', 'disabled'):
+                log(f'smoke test: cloud-init status: {status}')
+                break
+            if status == 'error':
+                raise pitlib.PitError('smoke test failed: cloud-init finished with an error: %s'
+                                      % ' '.join(text.split())[:300])
+            if time.time() >= deadline:
+                raise pitlib.PitError('smoke test failed: cloud-init still %s when the smoke-test time ran out'
+                                      % (status or 'not finished'))
+            sleep(SMOKE_POLL_SECONDS)
+    except pitlib.GuestCommandMissing:
+        log('smoke test: cloud-init is not installed in the guest; skipped the cloud-init check')
+    except pitlib.GuestExecUnsupported as e:
+        warnings.append('guest agent cannot exec commands; skipped the deep smoke checks (%s)' % str(e)[:120])
+        log('Warning: ' + warnings[-1])
+        return warnings
+
+    last = None
+    for attempt in range(SMOKE_SSH_ATTEMPTS):
+        try:
+            res = pitlib.guest_exec(vmid, ['sh', '-c', SMOKE_SSH_SCRIPT], timeout=30)
+        except pitlib.GuestExecUnsupported as e:
+            warnings.append('guest agent cannot exec commands; skipped the SSH smoke check (%s)' % str(e)[:120])
+            log('Warning: ' + warnings[-1])
+            return warnings
+        if res['exited'] and res['exitcode'] == 0:
+            log('smoke test: SSH host keys present, sshd -t ok, sshd running')
+            return warnings
+        output = ' '.join((res['out'] + ' ' + res['err']).split())[:300]
+        if not res['exited']:
+            last = 'the SSH check did not finish within 30s'
+        else:
+            last = '%s (exit %s): %s' % (SMOKE_SSH_FAILURES.get(res['exitcode'], 'SSH check failed'),
+                                        res['exitcode'], output or '-')
+        # sshd 可能比 cloud-init 晚几秒起来：重试几次再判失败
+        if attempt < SMOKE_SSH_ATTEMPTS - 1 and time.time() + SMOKE_POLL_SECONDS < deadline:
+            sleep(SMOKE_POLL_SECONDS)
+            continue
+        break
+    raise pitlib.PitError('smoke test failed: ' + last)
+
+
+def smoke_test(template_vmid: int, allocate, timeout: int, log, memory: int = 512, deep: bool = False,
+               storage: Optional[str] = None, sleep=None) -> list:
+    """切换前的开机闸：从新模板克隆一台临时 VM（拔掉所有网卡、摘掉 hookscript），开机后 timeout 秒内 qemu-guest-agent
+    必须应答（deep=True 时还要 cloud-init 跑完、SSH 可用，见 smoke_deep_checks），然后销毁。包升级会在 chroot 里动
+    内核 / initramfs / grub / extlinux；verify-image.sh 只能看文件，看不出「还能不能开机」。返回告警列表。
+
+    allocate：每次调用给一个临时号（从区间顶端往下取，不推高模板的游标）。撞号（集群里别的节点刚占了）换号重试，
+    链接克隆不支持时退回的全克隆那一步也一样。
+    storage：模板所在存储；给了就在销毁后扫一遍残留卷（只删这次出现的 vm-<tmp>-*）。
+    """
+    sleep = sleep or time.sleep
     tmp = None
     created = False
+    before = None
+    name = f'pitsmoke-{template_vmid}'
     try:
         for attempt in range(3):
             tmp = allocate()
+            before = pitlib.storage_volumes(storage, tmp) if storage else None
             try:
-                pitlib.run_cmd(['qm', 'clone', template_vmid, tmp, '--name', f'pitsmoke-{template_vmid}', '--full', '0'],
-                               timeout=600, log=log)
+                pitlib.run_cmd(['qm', 'clone', template_vmid, tmp, '--name', name, '--full', '0'], timeout=600, log=log)
             except pitlib.CommandError as e:
-                if 'already exists' in e.output and attempt < 2:
+                if pitlib.COLLISION_RE.search(e.output) and attempt < 2:
                     continue  # 集群里别的节点刚占了这个号
                 if 'linked clone' not in e.output.lower():
                     raise
                 # 只有「存储不支持链接克隆」（厚置备 LVM 等）才退回全克隆；锁超时之类的错误不该变成一次整盘拷贝
-                pitlib.run_cmd(['qm', 'clone', template_vmid, tmp, '--name', f'pitsmoke-{template_vmid}', '--full', '1'],
-                               timeout=1800, log=log)
+                try:
+                    pitlib.run_cmd(['qm', 'clone', template_vmid, tmp, '--name', name, '--full', '1'],
+                                   timeout=1800, log=log)
+                except pitlib.CommandError as e2:
+                    if pitlib.COLLISION_RE.search(e2.output) and attempt < 2:
+                        continue
+                    raise
             created = True
             break
         cfg = pitlib.vm_config(pitlib.local_node_name() or '', tmp)
@@ -895,18 +1090,20 @@ def smoke_test(template_vmid: int, allocate, timeout: int, log, memory: int = 51
             try:
                 pitlib.run_cmd(['qm', 'guest', 'cmd', tmp, 'ping'], timeout=20)
                 log(f'smoke test: VM {tmp} booted and the guest agent answered')
-                return
+                break
             except pitlib.CommandError:
                 if time.time() >= deadline:
                     raise pitlib.PitError(f'smoke test failed: a VM cloned from the new template did not answer the guest agent '
                                           f'within {timeout}s (bootloader / kernel broken by the upgrade?)') from None
-                time.sleep(10)
+                sleep(SMOKE_POLL_SECONDS)
+        return smoke_deep_checks(tmp, deadline, log, sleep=sleep) if deep else []
     finally:
         if created and tmp is not None:
-            subprocess.run(['qm', 'stop', str(tmp), '--skiplock', '1', '--timeout', '30'],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-            subprocess.run(['qm', 'destroy', str(tmp), '--purge', '1', '--skiplock', '1'],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            quiet_cmd(['qm', 'stop', tmp, '--skiplock', '1', '--timeout', '30'], timeout=180)
+            quiet_cmd(['qm', 'destroy', tmp, '--purge', '1', '--skiplock', '1'])
+            if storage:
+                with contextlib.suppress(pitlib.PitError):
+                    pitlib.free_leftover_volumes(storage, tmp, before, log=log)
 
 
 def build_template(template: dict, storage_name: str, vmid, *, vm_name: str,
@@ -916,17 +1113,21 @@ def build_template(template: dict, storage_name: str, vmid, *, vm_name: str,
                    node: Optional[str] = None, log=None, source_url: Optional[str] = None,
                    smoke_timeout: Optional[int] = None, smoke_allocate=None, extra_config: Optional[dict] = None,
                    disk_format: Optional[str] = None, expected_checksum: Optional[str] = None,
-                   require_checksum: bool = False) -> dict:
+                   require_checksum: bool = False, smoke_deep: bool = False, min_free_mem_mb: int = 0) -> dict:
     """下载 → 在副本上定制 → 建 VM（import-from）→ qm template →（可选）开机冒烟。返回写进模板的元数据（含 vmid）。
 
     vmid：整数，或无参可调用对象（每次调用重新分配一个号）——传可调用对象时 VMID 在 qm create 前一刻才分配，
-    撞上 already exists（集群里别的节点同时在建）换号重试。
-    任何一步失败都清理半成品 VM 与副本并抛异常；成功返回后模板已是 template=1，名字是 vm_name。
+    撞上 already exists / File exists（集群里别的节点同时在建、存储上有同号残留卷）换号重试；存储上已有这个号的卷时
+    干脆不用这个号。
+    任何一步失败都清理半成品 VM（及这次才出现的残留卷）与副本并抛异常；成功返回后模板已是 template=1，名字是 vm_name。
+    空间不够（写入后低于保留量）/ 冒烟前内存不够抛 pitlib.Deferred（调用方记推迟，不算失败）。
     keep_cache=False：结束后（成功或失败）删掉缓存的上游镜像，只留元数据——小硬盘节点不常驻十几 GB 缓存。
     smoke_timeout：秒；None = 不做开机冒烟。smoke_allocate：冒烟临时 VM 的号（默认同 vmid 分配器）。
-    extra_config：沿用旧模板的节点策略键（hookscript / vga / machine，见 pitlib.CARRY_OVER_KEYS）。
+    smoke_deep：冒烟时再查 cloud-init 跑完、SSH 可用（见 smoke_deep_checks）。min_free_mem_mb：冒烟前的可用内存下限。
+    extra_config：沿用旧模板的节点策略键（hookscript / vga / machine / … 见 pitlib.CARRY_OVER_KEYS）。
     disk_format：系统盘格式（文件类存储传 qcow2；None = 存储默认）。
     expected_checksum / require_checksum：见 fetch_image。
+    返回的元数据里 carried = 实际沿用的键，warnings = 冒烟告警（如 qga 不支持 exec 跳过了深度检查）。
     """
     log = log or (lambda m: print(m, file=sys.stderr))
     name = template['name']
@@ -935,14 +1136,23 @@ def build_template(template: dict, storage_name: str, vmid, *, vm_name: str,
     opts = dict(VM_DEFAULTS)
     opts.update(vm_opts or {})
     img_cache = os.path.join(CACHE_DIR, f'{name}.img')
+    node = node or pitlib.local_node_name() or ''
 
     fixed_vmid = vmid
     allocate = vmid if callable(vmid) else (lambda: fixed_vmid)  # 不能直接 lambda: vmid——下面会把 vmid 置 None
-    extra = pitlib.carry_over(extra_config or {})
+    attempts = 5 if callable(vmid) else 1   # 固定号撞了换不了号，重试没有意义
+    carried = pitlib.carry_over(extra_config or {})
+    # ostype / scsihw 是 qm create / import 本来就要设的键：沿用旧值替换默认值，不重复传参
+    ostype = carried.get('ostype', 'l26')
+    scsihw = carried.get('scsihw', 'virtio-scsi-single')
+    extra = {k: v for k, v in carried.items() if k not in ('ostype', 'scsihw')}
     created = False
     work = None
     vmid = None
+    volumes_before = None
     try:
+        # 目标存储写之前就已低于保留量（或 thin pool 元数据快满）：不下载，直接推迟
+        pitlib.ensure_storage_space(node, storage_name, 0)
         img, source = fetch_image(template, refresh, url=source_url, expected_checksum=expected_checksum,
                                   require_checksum=require_checksum)
         fmt = pitlib.inspect_image(img)
@@ -951,11 +1161,9 @@ def build_template(template: dict, storage_name: str, vmid, *, vm_name: str,
         work_dir = os.path.join(CACHE_DIR, 'work')
         os.makedirs(work_dir, exist_ok=True)
         work = os.path.join(work_dir, f'{name}.{os.getpid()}.img')
-        # 副本 + 包升级的增量；目标存储按虚拟大小估（厚置备 LVM 会整块分配，精简置备只会更少）
-        pitlib.ensure_space(f'cache dir {CACHE_DIR}', pitlib.free_bytes(work_dir), actual + pitlib.GIB)
-        pitlib.ensure_space(f'storage {storage_name}',
-                            pitlib.storage_avail(node or pitlib.local_node_name() or '', storage_name),
-                            virtual + pitlib.GIB // 2)
+        # 副本 + 包升级的增量；目标存储按虚拟大小估（厚置备 LVM 会整块分配，精简置备只会更少）。写入后两边都还要留余量
+        pitlib.ensure_fs_space(f'cache dir {CACHE_DIR}', work_dir, actual + pitlib.GIB)
+        pitlib.ensure_storage_space(node, storage_name, virtual + pitlib.GIB // 2)
 
         meta = {
             'v': pitlib.META_VERSION,
@@ -980,39 +1188,61 @@ def build_template(template: dict, storage_name: str, vmid, *, vm_name: str,
         if pitlib.inspect_image(work) != fmt:
             raise pitlib.PitError('customized image changed format; refusing to import it')
         extra_args = [x for key, value in sorted(extra.items()) for x in ('--' + key, value)]
-        for attempt in range(5):
+        fmt_opt = f',format={disk_format}' if disk_format else ''
+        for attempt in range(attempts):
+            last = attempt == attempts - 1
             vmid = allocate()
+            volumes_before = pitlib.storage_volumes(storage_name, vmid)
+            if volumes_before and not last:
+                # 存储上已有这个号的卷（共挂存储的另一台机器 / 早先的残留）：import-from / cloudinit 卷会撞 File exists
+                log(f'storage {storage_name} already has volumes for VMID {vmid} '
+                    f'({", ".join(sorted(volumes_before)[:3])}); trying another')
+                continue
             try:
                 pitlib.run_cmd(['qm', 'create', vmid, '--name', vm_name,
                                 '--memory', opts['memory'], '--cores', opts['cores'],
                                 '--net0', f'virtio,bridge={opts["bridge"]},queues=4',
-                                '--cpu', opts['cpu'], '--ostype', 'l26',
+                                '--cpu', opts['cpu'], '--ostype', ostype,
                                 '--agent', 'enabled=1,fstrim_cloned_disks=1',
                                 '--description', pitlib.encode_description(meta),
                                 '--tags', tags, *extra_args], timeout=300, log=log)
-                break
             except pitlib.CommandError as e:
                 # 构建要跑很久：期间集群里别的节点可能占了这个号。别人的 VM 绝不碰（created 还是 False），换号再来
-                if 'already exists' not in e.output or attempt == 4:
+                if not pitlib.COLLISION_RE.search(e.output) or last:
                     raise
                 log(f'VMID {vmid} was taken while building; trying another')
-        created = True
+                continue
+            created = True
+            try:
+                # import-from 一步导入并挂载，不再猜卷名（旧版写死 disk-0，存储上有残留盘时会挂错盘）
+                pitlib.run_cmd(['qm', 'set', vmid, '--scsihw', scsihw,
+                                '--scsi0', f'{storage_name}:0,import-from={work},discard=on{fmt_opt}'], timeout=1800, log=log)
+                pitlib.run_cmd(['qm', 'set', vmid, '--boot', 'order=scsi0', '--serial0', 'socket'], timeout=300, log=log)
+                if template.get('cloud_init'):
+                    pitlib.run_cmd(['qm', 'set', vmid, '--ide2', f'{storage_name}:cloudinit',
+                                    '--ciuser', 'root', '--ipconfig0', 'ip=dhcp'], timeout=300, log=log)
+            except pitlib.CommandError as e:
+                if not pitlib.COLLISION_RE.search(e.output) or last:
+                    raise
+                # 分配卷时撞上同号卷（vm-<id>-cloudinit 之类）：删掉自己这台、换号重来
+                log(f'VMID {vmid}: a volume with this number already exists on {storage_name}; trying another')
+                destroy_vm_quietly(vmid, storage_name, volumes_before, log)
+                created = False
+                continue
+            break
         meta['vmid'] = vmid
-        meta['carried'] = sorted(extra)
-        # import-from 一步导入并挂载，不再猜卷名（旧版写死 disk-0，存储上有残留盘时会挂错盘）
-        fmt_opt = f',format={disk_format}' if disk_format else ''
-        pitlib.run_cmd(['qm', 'set', vmid, '--scsihw', 'virtio-scsi-single',
-                        '--scsi0', f'{storage_name}:0,import-from={work},discard=on{fmt_opt}'], timeout=1800, log=log)
-        pitlib.run_cmd(['qm', 'set', vmid, '--boot', 'order=scsi0', '--serial0', 'socket'], timeout=300, log=log)
-        if template.get('cloud_init'):
-            pitlib.run_cmd(['qm', 'set', vmid, '--ide2', f'{storage_name}:cloudinit',
-                            '--ciuser', 'root', '--ipconfig0', 'ip=dhcp'], timeout=300, log=log)
+        meta['carried'] = sorted(carried)
         pitlib.run_cmd(['qm', 'template', vmid], timeout=600, log=log)
         if smoke_timeout:
-            smoke_test(vmid, smoke_allocate or allocate, smoke_timeout, log, memory=int(opts['memory']))
+            # 冒烟 VM 要 1 GiB：宿主机已经吃紧就别再开一台（建好的模板随失败清理删掉，下一轮再来）
+            pitlib.ensure_memory(min_free_mem_mb)
+            warnings = smoke_test(vmid, smoke_allocate or allocate, smoke_timeout, log, memory=int(opts['memory']),
+                                  deep=smoke_deep, storage=storage_name)
+            if warnings:
+                meta['warnings'] = warnings
     except BaseException:
         if created:
-            destroy_vm_quietly(vmid)
+            destroy_vm_quietly(vmid, storage_name, volumes_before, log)
         raise
     finally:
         if work:

@@ -82,7 +82,8 @@ class BuildTemplateTest(unittest.TestCase):
         self.assertEqual(meta['vmid'], 9051)
 
     def test_hookscript_and_policy_keys_are_carried_into_the_new_template(self):
-        meta = self.build(9042, extra_config={'hookscript': 'local:snippets/hook.sh', 'vga': 'serial0', 'args': '-evil'})
+        meta = self.build(9042, extra_config={'hookscript': 'local:snippets/hook.sh', 'vga': 'serial0',
+                                              'args': '-smbios type=1,serial=ds=nocloud;s=http://x/'})
         create = [c for c in self.commands if c[:2] == ['qm', 'create']][0]
         self.assertIn('--hookscript', create)
         self.assertEqual(create[create.index('--hookscript') + 1], 'local:snippets/hook.sh')
@@ -151,3 +152,158 @@ class DownloadSafetyTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class BuildV22Test(BuildTemplateTest):
+    """2.2.0：撞号 / 残留卷、ostype / scsihw 沿用、冒烟前内存、深度冒烟。"""
+
+    def setUp(self):
+        super().setUp()
+        self.volumes = {}            # vmid -> pvesm list 输出里的卷（模拟存储）
+        self.exec_replies = []       # qm guest exec 依次返回的 JSON（或异常）
+        self.import_error = {}       # vmid -> qm set --scsi0 的报错输出
+        orig = pitlib.run_cmd.side_effect
+
+        def run_cmd(argv, timeout=None, env=None, log=None):
+            argv = [str(a) for a in argv]
+            if argv[:2] == ['pvesm', 'list']:
+                self.commands.append(argv)
+                vid = int(argv[argv.index('--vmid') + 1])
+                return 'Volid Format Type Size VMID\n' + ''.join('%s raw images 1 %d\n' % (v, vid)
+                                                                 for v in self.volumes.get(vid, []))
+            if argv[:3] == ['qm', 'guest', 'exec']:
+                self.commands.append(argv)
+                reply = self.exec_replies.pop(0)
+                if isinstance(reply, Exception):
+                    raise reply
+                return reply
+            if argv[:2] == ['qm', 'set'] and '--scsi0' in argv and int(argv[2]) in self.import_error:
+                self.commands.append(argv)
+                vid = int(argv[2])
+                self.volumes.setdefault(vid, []).append('local-lvm:vm-%d-disk-0' % vid)   # import 写了一半
+                raise pitlib.CommandError('qm set failed', 255, self.import_error[vid])
+            return orig(argv, timeout=timeout, env=env, log=log)
+        pitlib.run_cmd.side_effect = run_cmd
+        p = mock.patch.object(imp.time, 'sleep')
+        p.start()
+        self.addCleanup(p.stop)
+
+    @staticmethod
+    def exec_json(code, out=''):
+        import json
+        return json.dumps({'exitcode': code, 'exited': 1, 'out-data': out})
+
+    def test_file_exists_while_allocating_volumes_retries_with_another_vmid(self):
+        ids = iter([9050, 9051])
+        self.import_error[9050] = "lvcreate 'pve/vm-9050-cloudinit' error: Logical volume already exists"
+        meta = self.build(lambda: next(ids))
+        self.assertEqual(meta['vmid'], 9051)
+        destroys = [c.args[0] for c in imp.subprocess.run.call_args_list if c.args[0][:2] == ['qm', 'destroy']]
+        self.assertIn(['qm', 'destroy', '9050', '--purge', '1', '--skiplock', '1'], destroys)
+        # import 写了一半的卷是这次才出现的、名字是 vm-9050-*：删掉
+        self.assertIn(['pvesm', 'free', 'local-lvm:vm-9050-disk-0'], self.commands)
+
+    def test_vmid_with_foreign_volumes_on_the_storage_is_not_used(self):
+        ids = iter([9050, 9051])
+        self.volumes[9050] = ['local-lvm:vm-9050-cloudinit']    # 共挂存储的另一台机器的
+        meta = self.build(lambda: next(ids))
+        self.assertEqual(meta['vmid'], 9051)
+        self.assertFalse([c for c in self.commands if c[:3] == ['qm', 'create', '9050']])
+        self.assertFalse([c for c in self.commands if c[:2] == ['pvesm', 'free']])
+
+    def test_failed_build_frees_only_its_own_new_volumes(self):
+        self.volumes[9042] = ['local-lvm:vm-9042-disk-7']        # 建之前就在（不是我们的）
+        self.import_error[9042] = 'import failed: no space left on device'
+        with self.assertRaises(pitlib.CommandError):
+            self.build(9042)
+        frees = [c for c in self.commands if c[:2] == ['pvesm', 'free']]
+        self.assertEqual(frees, [['pvesm', 'free', 'local-lvm:vm-9042-disk-0']])
+
+    def test_ostype_and_scsihw_replace_the_defaults(self):
+        meta = self.build(9042, extra_config={'ostype': 'l24', 'scsihw': 'virtio-scsi-pci', 'numa': '1'})
+        create = [c for c in self.commands if c[:2] == ['qm', 'create']][0]
+        self.assertEqual(create.count('--ostype'), 1)
+        self.assertEqual(create[create.index('--ostype') + 1], 'l24')
+        self.assertEqual(create[create.index('--numa') + 1], '1')
+        self.assertNotIn('--scsihw', create)
+        scsi = [c for c in self.commands if '--scsi0' in c][0]
+        self.assertEqual(scsi[scsi.index('--scsihw') + 1], 'virtio-scsi-pci')
+        self.assertEqual(meta['carried'], ['numa', 'ostype', 'scsihw'])
+
+    def test_low_memory_before_smoke_defers_and_cleans_up(self):
+        with mock.patch.object(pitlib, 'mem_available_mb', return_value=1000):
+            with self.assertRaises(pitlib.Deferred):
+                self.build(9042, smoke_timeout=60, smoke_allocate=lambda: 9999, min_free_mem_mb=4096)
+        self.assertFalse([c for c in self.commands if c[:2] == ['qm', 'clone']])
+        self.assertTrue(any(c.args[0][:3] == ['qm', 'destroy', '9042'] for c in imp.subprocess.run.call_args_list))
+
+    def deep(self):
+        return self.build(9042, smoke_timeout=600, smoke_allocate=lambda: 9999, smoke_deep=True)
+
+    def test_deep_smoke_waits_for_cloud_init_then_checks_ssh(self):
+        self.exec_replies = [self.exec_json(0, 'status: running\n'), self.exec_json(2, 'status: done\n'),
+                             self.exec_json(0)]
+        meta = self.deep()
+        self.assertNotIn('warnings', meta)
+        execs = [c for c in self.commands if c[:3] == ['qm', 'guest', 'exec']]
+        self.assertEqual(execs[0][-2:], ['cloud-init', 'status'])
+        self.assertEqual(execs[-1][-3:-1], ['sh', '-c'])
+        self.assertIn('sshd', execs[-1][-1])
+
+    def test_deep_smoke_cloud_init_error_fails_the_build(self):
+        self.exec_replies = [self.exec_json(1, 'status: error\n')]
+        with self.assertRaises(pitlib.PitError) as ctx:
+            self.deep()
+        self.assertIn('cloud-init finished with an error: status: error', str(ctx.exception))
+        self.assertTrue(any(c.args[0][:3] == ['qm', 'destroy', '9042'] for c in imp.subprocess.run.call_args_list))
+
+    def test_deep_smoke_cloud_init_still_running_at_the_deadline_fails(self):
+        self.exec_replies = [self.exec_json(0, 'status: running\n')] * 50
+        clock = iter(range(0, 100000, 100))
+        with mock.patch.object(imp.time, 'time', side_effect=lambda: next(clock)):
+            with self.assertRaises(pitlib.PitError) as ctx:
+                self.deep()
+        self.assertIn('cloud-init still running', str(ctx.exception))
+
+    def test_deep_smoke_ssh_failures_name_the_failing_check(self):
+        self.exec_replies = [self.exec_json(0, 'status: done\n')] + [self.exec_json(13, '/etc/ssh/sshd_config line 3: Bad')] * 3
+        with self.assertRaises(pitlib.PitError) as ctx:
+            self.deep()
+        self.assertIn('sshd -t rejects the configuration (exit 13)', str(ctx.exception))
+        self.exec_replies = [self.exec_json(0, 'status: done\n')] + [self.exec_json(11)] * 3
+        with self.assertRaises(pitlib.PitError) as ctx:
+            self.build(9043, smoke_timeout=600, smoke_allocate=lambda: 9998, smoke_deep=True)
+        self.assertIn('SSH host keys were not generated', str(ctx.exception))
+
+    def test_deep_smoke_without_exec_support_is_a_warning(self):
+        self.exec_replies = [pitlib.CommandError('x', 255, 'Agent error: The command guest-exec has not been found')]
+        meta = self.deep()
+        self.assertEqual(len(meta['warnings']), 1)
+        self.assertIn('cannot exec', meta['warnings'][0])
+
+    def test_deep_smoke_skips_cloud_init_when_it_is_not_installed(self):
+        self.exec_replies = [pitlib.CommandError('x', 255, "Failed to execute child process “cloud-init” (No such file "
+                                                           "or directory)"), self.exec_json(0)]
+        meta = self.deep()
+        self.assertNotIn('warnings', meta)
+        self.assertEqual(self.exec_replies, [])
+
+    def test_smoke_full_clone_fallback_retries_on_collision(self):
+        self.clone_error = 'Linked clone feature is not supported for drive scsi0'
+        tmp_ids = iter([9999, 9998])
+        orig = pitlib.run_cmd.side_effect
+
+        def run_cmd(argv, **kw):
+            a = [str(x) for x in argv]
+            if a[:4] == ['qm', 'clone', '9042', '9999'] and a[-1] == '1':
+                self.commands.append(a)
+                raise pitlib.CommandError('clone failed', 255, 'unable to create VM 9999: config file already exists')
+            return orig(argv, **kw)
+        pitlib.run_cmd.side_effect = run_cmd
+        self.build(9042, smoke_timeout=60, smoke_allocate=lambda: next(tmp_ids))
+        full = [c for c in self.commands if c[:2] == ['qm', 'clone'] and c[-1] == '1']
+        self.assertEqual([c[3] for c in full], ['9999', '9998'])
+
+    def test_cleanup_commands_have_timeouts(self):
+        imp.destroy_vm_quietly(9042)
+        self.assertIn('timeout', imp.subprocess.run.call_args.kwargs)
