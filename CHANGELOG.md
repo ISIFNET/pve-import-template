@@ -2,6 +2,81 @@
 
 本文件记录对 pve-import-template 的主要改动。
 
+## [2.2.0] - 2026-11-06
+
+### 回滚、hold、暂停、金丝雀
+
+- `sync-templates.py --rollback NAME`：在本节点 VMID 区间内找最新的、带 `pit-retired`、名字形如 `<NAME>-retired-<UTC>`、未锁的退役模板，
+  改回 `<NAME>` 并去掉 `pit-retired`（其它 tag 保留），当前在役的同名模板按标准流程退役（先恢复再退役；退役失败撤销恢复）。
+  没有可恢复版本时退出码 1。写 hold：`holds[NAME] = {at, by: "rollback", bad_vmid, bad_source, restored_vmid, bad_url, bad_checksum}`，
+  本次运行也写进 `last-run.json`（行 `action=rolled-back`，其它模板的行保留）。`--release NAME` 删除 hold。
+- hold：`stale` / `recipe-changed` / `legacy` / 同一个坏源的 `source-changed` / pending forced 全部跳过（`action=held`），`--force` 不越过；
+  上游源标识变了（新文件名，或同一地址校验和变了）自动解除，行 detail 注明 `hold released: new upstream image`；目录索引打不开不算变。
+- `PAUSED=1`：sync 拿锁后直接结束（退出码 0），状态写 `paused: true` / `message`，退避 / hold / pending / 游标保留。
+- `SOURCE_DELAY_HOURS`（默认 24）：上游新镜像首次见到后满 N 小时才采用（`action=waiting`），状态记 `sources_seen`；0 = 金丝雀立即采用；
+  `--force` 不受限；只影响 `source-changed`。
+
+### 强制重建不再丢失、资源不够只推迟
+
+- 被 `MAX_BUILDS` / `RUN_BUDGET_HOURS` / 低内存 / 空间不够 / appliance 起不来推迟的、以及被中断的强制重建写进 `pending_forced`，
+  之后不带 `--force` 的运行当 `forced` 建（detail `pending forced rebuild since …`，遵守失败退避），建成后清除。
+- 新配置 `MIN_FREE_MEM_MB`（默认 4096）：构建前、冒烟前读 MemAvailable，不够 `deferred`（`low memory: …`），不记失败、不进退避。
+- 空间保留量：缓存 / 工作目录写入后至少剩 max(10 GiB, 10%)，目标存储至少剩 max(20 GiB, 10%)，lvmthin 的 thin pool 元数据 ≥ 80% 不再写；
+  不够 `deferred`（`not enough space: …`）。下载前先预检存储。libguestfs appliance 内存 `LIBGUESTFS_MEMSIZE=1024`。
+- `RUN_BUDGET_HOURS`（默认 4，0 = 不限）：本轮超过时长后不再开新构建（`run budget exhausted`）。
+- libguestfs appliance 起不来（LaunchError）后，本轮其余模板直接 `deferred`，不再逐个下载、逐个失败。
+- 集群没有 quorum：退出码 4，整轮跳过，状态写 `ok=false` + `message`，不记 failures；systemd 单元 `SuccessExitStatus=3 4`。
+
+### 冒烟加深
+
+- `SMOKE_DEEP=1`（默认）：qga 应答后、同一 `SMOKE_TIMEOUT` 预算内，`qm guest exec` 轮询 `cloud-init status` 到 done / disabled
+  （degraded 也算过；error 或超时仍 running 失败；来宾没装 cloud-init 跳过），再查 SSH host key 已生成、`sshd -t` 通过、
+  sshd 服务或 socket 在跑（Ubuntu 22.10+ 是 socket 激活，`ssh.service` 平时就是 inactive）。agent 不支持 `guest-exec` 只记告警。
+
+### 切换安全
+
+- hookscript 防御检查真正生效：切换前读新模板的**实际**配置，与旧模板的**原始** hookscript 比较，没带上 / 不同就不切换（并删掉这次建的 `-pitbuild`）；
+  旧模板 hookscript 格式不认识则根本不建（旧版这个检查和沿用的配置同源，恒为假）。
+- 沿用的节点策略键增加 `nameserver` `searchdomain` `cicustom` `ciupgrade` `numa` `tablet` `rng0` `scsihw` `ostype` `args`（逐个正则白名单，
+  不经 shell；`protection` 不沿用）；其余旧模板有而新模板没有的键列在行 `warnings` 里。
+- EL10（rocky-10 / almaLinux-10 / centos-stream-10）`min_cpu_level: 3`：宿主机达不到 x86-64-v3 记 `skipped`（`host CPU lacks x86-64-v3`）、不补缺；
+  旧模板 cpu 不是 `host` / `max` / `x86-64-v3+` 时新模板改用 `host`。`min_cpu_level` / `display_name` 与 `eol` 一样不进配方指纹。
+- VMID 游标除了本节点状态，再读写集群共享文件 `/etc/pve/pit-vmid-hw`（取较大者，写失败不致命）；游标记最近分配的号，转满一圈回绕后跟着回到低位。
+- 撞号：`already exists` / `File exists` 都换号重试（卷分配阶段撞号也删掉自己重来），存储上已有同号卷的 VMID 直接跳过；冒烟退回全克隆那一步也重试。
+
+### 清理与中断
+
+- 中断时状态文件保留本轮明细（`templates` 直接引用行列表）；在建模板记 failures `kind=interrupted`，退避 2 小时。
+- 半成品清理：带 clone / create 锁的 `pitsmoke-*` / `-pitbuild` 核对 tag / 元数据后 `--skiplock` 删，其它锁记 gc 备注；
+  构建 / 冒烟失败后用 `pvesm list --vmid` 找残留卷，只删这次才出现的 `vm-<id>-*` / `base-<id>-*`；中断时删 `.img.download`，下一轮清理也清；
+  清理命令都有超时。`CACHE_DIR` 可在配置里指定。
+- `ADD_MISSING` 遇到放不了模板的存储（厚置备 lvm / iscsi / iscsidirect / pbs / cephfs / esxi、不允许 images）直接 `skipped`，不下载。
+- GC 对本节点所有带 `pit-retired` 的 templates.yaml 名字执行（不只本轮 built / current 的行；未选中名字的结果在报告 `gc` 里）。
+
+### 报告与输出
+
+- 状态文件 / `--json` 新增 `paused` `holds` `pending_forced` `sources_seen` `message`；`summary` 含全部 action 的计数（没有的记 0）；
+  每行补 `storage` `format` `bridge` `hookscript` `next_vmid` `source`（上游文件名；建成的行另有 `source_url`）`reason`。
+- 行 `action` 收敛到固定词表：built / current / failed / deferred / backoff / absent / held / waiting / skipped / would-build /
+  would-retire / would-delete / rolled-back。`ADOPT_LEGACY=0` 时的旧模板由 `action=legacy` 改为 `skipped` + `reason=legacy`。
+- `--dry-run`：将删除的写成 `would-delete`，`would-retire` 也打印；计划行带 storage / fmt / bridge / hook / vmid≈ / src / reason。
+- `--list`：标出区间外（`out-of-range`，不再算 legacy）、是否在 yaml、是否 EOL、当前配置是否维护、存储、有无 hookscript、
+  退役多久 / 能否回收、protection、lock。
+- 结尾单独的 `--`（`--json --`）统一丢弃，不同 Python 版本行为一致。
+- 新增 `manifest.py`：输出模板清单 JSON（`tool_version` / `default_profile` / 展开后的 `profiles` / 每个模板的 family、版本、显示名、
+  eol、min_cpu_level），平台 vendoring 时生成 `templates.manifest.json`。
+
+### 其它
+
+- `uploads/upgrade-packages.sh`：去掉 Ubuntu 的 `Always-Include-Phased-Updates`（模板不该比普通机器更早吃到还在分阶段推送的包）；
+  dnf / yum / microdnf 与 apt 一样重试。**脚本内容变了 = 配方变了**：升级后各节点会按 `recipe-changed` 把开了包升级的模板重建一遍
+  （`MAX_BUILDS` 限流，几天内完成）。
+- EL 换源按发行版区分：`mirrors` 新增 `rocky` / `almalinux` / `centos-stream` 条目（Stream 9/10 把 metalink 改写成 baseurl）；
+  只配了旧 `rhel` 条目的镜像站不再把 Rocky / Alma / Stream 改到 `…/centos` 路径（会 404），而是保持官方源。huawei 暂未配 EL 条目。
+- `update-templates.py --all` 默认跳过带 `pit` tag 的模板（2.x 托管的不能就地改），`--include-managed` 才处理。
+- README：回滚 / 暂停 / 金丝雀 / 备份排除模板章节；agent 安装的节点（`/opt/pve-import-template`）没有 run.sh / tui.py 的用法说明；
+  minimal 列表补 rocky-9；配置示例补全新键。
+
 ## [2.1.0] - 2026-11-06
 
 ### 默认导入哪些系统

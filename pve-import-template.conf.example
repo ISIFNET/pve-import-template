@@ -13,6 +13,8 @@ ADD_MISSING=0
 STORAGE=
 # 新模板网卡接的网桥（重建沿用旧模板的网桥）
 BRIDGE=
+# 1 = 旧工具导入的（没有构建元数据的）同名模板也按 templates.yaml 重建接管；0 = 只维护本工具建的，旧模板原样不动
+ADOPT_LEGACY=1
 
 # 新模板 VMID 区间（rhapsi 平台只识别 9001-9999）
 VMID_MIN=9001
@@ -39,3 +41,22 @@ BACKOFF_HOURS=20
 # 切换前的开机冒烟：从新模板克隆一台不接网卡的临时 VM，等 qemu-guest-agent 应答（秒）；嵌套 / TCG 节点调大
 SMOKE_TEST=1
 SMOKE_TIMEOUT=600
+# 冒烟加深（同一个 SMOKE_TIMEOUT 预算内）：cloud-init 跑完（done / disabled）、SSH host key 已生成、sshd -t 通过、sshd 在跑
+SMOKE_DEEP=1
+
+# 1 = 暂停本节点的自动维护：sync 拿锁后什么都不做（退出码 0，状态文件写 paused）。--rollback / --release / --list 照常可用
+PAUSED=0
+
+# 上游新镜像第一次见到后满多少小时才采用（期间显示 waiting）。金丝雀节点设 0 先吃新镜像，其余节点等一天：
+# 新镜像有问题时有时间在金丝雀上发现、在别的节点 --rollback / hold 住。只影响「上游变了」，不影响过期 / 配方变化
+SOURCE_DELAY_HOURS=24
+
+# 每个模板构建前 / 冒烟前要求的可用内存（MiB，读 /proc/meminfo 的 MemAvailable）；不够记 deferred，不算失败
+MIN_FREE_MEM_MB=4096
+
+# 本轮开始超过多少小时就不再开新构建（剩下的 deferred，下一轮再建）；0 = 不限。systemd 单元的硬上限是 6 小时
+RUN_BUDGET_HOURS=4
+
+# 下载缓存目录（绝对路径；留空 = 环境变量 CLOUD_IMG_DIR，再不设 = 工具目录下的 cloud_img）。
+# 写入后该文件系统至少要剩 max(10 GiB, 10%)，目标存储至少要剩 max(20 GiB, 10%)，否则记 deferred
+CACHE_DIR=

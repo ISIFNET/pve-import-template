@@ -572,5 +572,15 @@ class ArgsTest(unittest.TestCase):
                 pitlib.parse_conf_text(bad + '\n', sync.CONF_SCHEMA)
 
 
+class ConfExampleTest(unittest.TestCase):
+    def test_example_lists_every_key_with_the_default_value(self):
+        path = os.path.join(test_sync.ROOT, 'pve-import-template.conf.example')
+        with open(path) as fh:
+            text = fh.read()
+        self.assertEqual(pitlib.parse_conf_text(text, sync.CONF_SCHEMA), pitlib.parse_conf_text('', sync.CONF_SCHEMA))
+        for key in sync.CONF_SCHEMA:
+            self.assertRegex(text, r'(?m)^%s=' % key)
+
+
 if __name__ == '__main__':
     unittest.main()
