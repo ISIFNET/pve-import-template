@@ -94,6 +94,9 @@ MAX_IMAGE_BYTES = 8 * 1024 ** 3
 
 # 模板名会进 qm --name、缓存文件名、import-from 路径：只许 DNS 名字符
 TEMPLATE_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9.-]{0,40}$')
+# min_packages 的包名 / 版本：会写进镜像里的构建信息并由 verify-image.sh 读出来比较，只放包管理器认的字符
+PACKAGE_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9.+_-]{0,63}$')
+PACKAGE_VERSION_RE = re.compile(r'^[0-9A-Za-z][0-9A-Za-z.+~:_-]{0,63}$')
 
 # 未在 templates.yaml 里声明 default_profile 时的默认配置组（不指定模板时导入它、向导默认勾选它）
 DEFAULT_PROFILE = 'standard'
@@ -945,7 +948,8 @@ def customization_args(template: dict, mirror_config: Optional[dict], apply_tuni
     return args
 
 
-def write_build_info(name: str, built_at: int, source: dict) -> str:
+def write_build_info(name: str, built_at: int, source: dict, packages: Optional[dict] = None) -> str:
+    """镜像里的 /etc/pve-template-release。MIN_PACKAGE 行是 verify-image.sh 要核对的安全下限（也留在模板里说明它按什么核对过）。"""
     fd, path = tempfile.mkstemp(prefix='pit_build_info_', suffix='.txt')
     _TEMP_FILES.append(path)
     with os.fdopen(fd, 'w') as fh:
@@ -954,6 +958,8 @@ def write_build_info(name: str, built_at: int, source: dict) -> str:
         fh.write(f'SOURCE_URL={source.get("url", "")}\n')
         fh.write(f'SOURCE_SHA256={source.get("sha256", "")}\n')
         fh.write(f'BUILDER=pve-import-template {TOOL_VERSION}\n')
+        for pkg, version in sorted((packages or {}).items()):
+            fh.write(f'MIN_PACKAGE={pkg} {version}\n')
     return path
 
 
@@ -1178,7 +1184,7 @@ def build_template(template: dict, storage_name: str, vmid, *, vm_name: str,
             'recipe': recipe_of(template, apply_tuning, upgrade, mirror_name),
         }
 
-        info = write_build_info(name, built_at, source)
+        info = write_build_info(name, built_at, source, min_packages(template))
         pitlib.run_virt_customize(work, customization_args(template, mirror_config, apply_tuning, upgrade, info),
                                   timeout=CUSTOMIZE_TIMEOUT, force_tcg=force_tcg, log=log, fmt=fmt,
                                   prepare=lambda: shutil.copyfile(img, work))
@@ -1352,11 +1358,49 @@ def load_config() -> dict:
     cfg_path = os.path.join(SCRIPT_DIR, 'templates.yaml')
     with open(cfg_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f) or {}
+    validate_config(config)
+    _CONFIG_CACHE = config
+    return config
+
+
+def validate_config(config: dict):
+    names = set()
     for tpl in config.get('templates', []) or []:
         if not TEMPLATE_NAME_RE.match(str(tpl.get('name', ''))):
             raise pitlib.PitError(f'templates.yaml: invalid template name {tpl.get("name")!r}')
-    _CONFIG_CACHE = config
-    return config
+        names.add(tpl['name'].lower())
+        min_packages(tpl)
+    for tpl in retired_templates(config):
+        if tpl['name'].lower() in names:
+            raise pitlib.PitError(f'templates.yaml: {tpl["name"]} is both in templates and retired')
+
+
+def min_packages(template: dict) -> dict:
+    """模板的安全下限 {包名: 最低版本}；写错直接报错（宁可整个配置读不进来，也不要静默放过一个没核对的漏洞修复）。"""
+    raw = template.get('min_packages')
+    if raw in (None, {}):
+        return {}
+    if not isinstance(raw, dict):
+        raise pitlib.PitError(f'templates.yaml: {template.get("name")}: min_packages must be a mapping of package: version')
+    out = {}
+    for pkg, version in raw.items():
+        version = str(version) if isinstance(version, (int, float)) and not isinstance(version, bool) else version
+        if not isinstance(pkg, str) or not PACKAGE_NAME_RE.match(pkg) \
+                or not isinstance(version, str) or not PACKAGE_VERSION_RE.match(version):
+            raise pitlib.PitError(f'templates.yaml: {template.get("name")}: invalid min_packages entry {pkg!r}: {version!r}')
+        out[pkg] = version
+    return out
+
+
+def retired_templates(config: dict) -> list:
+    """已 EOL、不再获取的模板（templates.yaml 的 retired 列表）：只有名字与显示名，不参与 import / sync。"""
+    out = []
+    for item in config.get('retired') or []:
+        tpl = {'name': item} if isinstance(item, str) else item
+        if not isinstance(tpl, dict) or not TEMPLATE_NAME_RE.match(str(tpl.get('name', ''))):
+            raise pitlib.PitError(f'templates.yaml: invalid retired entry {item!r}')
+        out.append(tpl)
+    return out
 
 
 def print_template_list():
@@ -1393,6 +1437,9 @@ def print_template_list():
             print(f'  {mark} - {name}{suffix}')
     others = ', '.join('@' + p for p in (config.get('profiles') or {}) if p != profile)
     print(f'\n默认配置组 @{profile}：{len(defaults)} 个（--all 导入全部；其他配置组：{others or "无"}；选择器也可写系列名）')
+    retired = [t['name'] for t in retired_templates(config)]
+    if retired:
+        print(f'已停止维护、不再获取：{", ".join(retired)}（节点上已有的同名模板不重建，确认没有链接克隆后可删除）')
     mirrors = config.get('mirrors', {})
     if mirrors:
         print(f'可用镜像源：{", ".join(mirrors.keys())}')

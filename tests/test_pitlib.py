@@ -261,6 +261,46 @@ class ConfAndSelectionTest(unittest.TestCase):
         self.assertEqual(imp.recipe_of({**tpl, 'eol': True}, True, True, None), base)
         self.assertNotEqual(imp.recipe_of({**tpl, 'net_tuning': False}, True, True, None), base)
 
+    def test_retired_list_is_never_built_or_listed(self):
+        cfg = imp.load_config()
+        live = {t['name'].lower() for t in cfg['templates']}
+        retired = {t['name'].lower() for t in imp.retired_templates(cfg)}
+        self.assertTrue(retired)
+        self.assertEqual(live & retired, set())
+        # --all / @full / 系列名都只在 templates 里挑：EOL 的不会被重新导入
+        self.assertEqual({t['name'].lower() for t in imp.match_templates(cfg['templates'], '*', config=cfg)} & retired, set())
+        with self.assertRaises(pitlib.PitError):
+            imp.validate_config({'templates': [{'name': 'debian-11'}], 'retired': ['Debian-11']})
+        with self.assertRaises(pitlib.PitError):
+            imp.validate_config({'retired': ['bad name;x']})
+
+    def test_alpine_templates_carry_the_openssh_floor(self):
+        # 2026-11-05 OpenSSH 10.6p2：musl + 无 PAM 的 sshd 密码认证可被绕过，Alpine 各分支回移的修复版本
+        floors = {t['name']: imp.min_packages(t) for t in imp.load_config()['templates'] if t['name'].lower().startswith('alpine')}
+        self.assertEqual(floors, {'alpineLinux-3.22': {'openssh-server': '10.0_p1-r11'},
+                                  'alpineLinux-3.23': {'openssh-server': '10.2_p1-r1'},
+                                  'alpineLinux-3.24': {'openssh-server': '10.3_p1-r2'}})
+
+    def test_min_packages_validation(self):
+        self.assertEqual(imp.min_packages({'name': 'x'}), {})
+        self.assertEqual(imp.min_packages({'name': 'x', 'min_packages': {'openssh-server': '1:9.6p1-3'}}), {'openssh-server': '1:9.6p1-3'})
+        for bad in ({'openssh-server': '10.0;reboot'}, {'open ssh': '1'}, ['openssh-server'], {'openssh-server': None},
+                    {'openssh-server': '1\nMIN_PACKAGE=x 0'}):
+            with self.assertRaises(pitlib.PitError, msg=repr(bad)):
+                imp.min_packages({'name': 'x', 'min_packages': bad})
+
+    def test_raising_a_security_floor_rebuilds_the_template(self):
+        tpl = {'name': 'alpineLinux-3.22', 'url': 'https://d/a.qcow2', 'cloud_init': True}
+        base = imp.recipe_of(tpl, True, True, None)
+        floor = imp.recipe_of({**tpl, 'min_packages': {'openssh-server': '10.0_p1-r11'}}, True, True, None)
+        self.assertNotEqual(floor, base)
+        self.assertNotEqual(imp.recipe_of({**tpl, 'min_packages': {'openssh-server': '10.0_p1-r12'}}, True, True, None), floor)
+
+    def test_build_info_lists_the_floors_for_verify(self):
+        path = imp.write_build_info('alpineLinux-3.22', 0, {'url': 'u', 'sha256': 's'}, {'openssh-server': '10.0_p1-r11'})
+        with open(path) as fh:
+            self.assertIn('MIN_PACKAGE=openssh-server 10.0_p1-r11\n', fh.read())
+
     def test_default_selection_without_profiles_falls_back_to_supported_templates(self):
         cfg = {'templates': [{'name': 'debian-10', 'eol': True}, {'name': 'debian-13', 'eol': '2030-06-30'}, {'name': 'archLinux'}]}
         self.assertEqual(imp.default_template_names(cfg), ['debian-13', 'archLinux'])

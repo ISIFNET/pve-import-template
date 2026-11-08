@@ -5,6 +5,7 @@
 # 平台克隆出来才发现密码重置 / fstrim 不工作。这里补上闸门：
 #   1. qemu-guest-agent 二进制存在，且会随系统启动
 #   2. sshd 的**生效配置**（sshd -T，考虑 drop-in 与 Match 之后）里 permitrootlogin = yes
+#   3. templates.yaml 的 min_packages 安全下限（构建信息里的 MIN_PACKAGE 行）：包已装且版本不低于下限
 set -u
 
 fail=0
@@ -77,6 +78,72 @@ else
   fi
   rm -rf "$KEYDIR"
   [ "$PRIVSEP_CREATED" = 1 ] && rmdir /run/sshd 2>/dev/null
+fi
+
+# ---- 4) 安全下限（templates.yaml min_packages → /etc/pve-template-release 的 MIN_PACKAGE=<包> <最低版本>）----
+# 镜像站滞后时 apk / apt 升级拿到的还是有漏洞的版本：这里比对实装版本，不够就让构建失败（旧模板保持在役），不靠升级脚本的退出码
+BUILD_INFO=/etc/pve-template-release
+
+# 已装版本；没装输出空
+installed_version() {
+  if command -v apk >/dev/null 2>&1; then
+    awk -v p="$1" 'BEGIN{RS=""; FS="\n"} { name=""; ver=""; for (i=1;i<=NF;i++) { if ($i ~ /^P:/) name=substr($i,3); if ($i ~ /^V:/) ver=substr($i,3) } if (name==p) { print ver; exit } }' \
+      /lib/apk/db/installed 2>/dev/null
+  elif command -v dpkg-query >/dev/null 2>&1; then
+    dpkg-query -W -f='${db:Status-Status} ${Version}\n' "$1" 2>/dev/null | awk '$1=="installed"{print $2; exit}'
+  elif command -v rpm >/dev/null 2>&1; then
+    rpm -q --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n' "$1" 2>/dev/null | head -n 1 | grep -v 'not installed'
+  fi
+}
+
+# 0 = 已装版本 >= 下限；1 = 更低；2 = 比不了（没有可用的比较工具）
+version_at_least() {
+  have="$1"; want="$2"
+  if command -v apk >/dev/null 2>&1; then
+    case "$(apk version -t "$have" "$want" 2>/dev/null)" in
+      '>'|'=') return 0 ;;
+      '<') return 1 ;;
+      *) return 2 ;;
+    esac
+  elif command -v dpkg >/dev/null 2>&1; then
+    dpkg --compare-versions "$have" ge "$want" && return 0
+    dpkg --compare-versions "$have" lt "$want" && return 1
+    return 2
+  elif command -v rpm >/dev/null 2>&1; then
+    case "$want" in *:*) ;; *) want="0:$want" ;; esac
+    r="$(rpm --eval "%{lua: print(rpm.vercmp('$have', '$want'))}" 2>/dev/null)"
+    case "$r" in
+      -1) return 1 ;;
+      0|1) return 0 ;;
+    esac
+    return 2
+  fi
+  return 2
+}
+
+if [ -r "$BUILD_INFO" ]; then
+  # 读完再循环：管道里的 while 在子 shell，改不了 fail
+  floors="$(sed -n 's/^MIN_PACKAGE=//p' "$BUILD_INFO")"
+  OLDIFS=$IFS
+  IFS='
+'
+  for line in $floors; do
+    IFS=$OLDIFS
+    pkg="${line%% *}"; want="${line#* }"
+    have="$(installed_version "$pkg")"
+    if [ -z "$have" ]; then
+      log "FAIL: $pkg is not installed (template requires >= $want)"
+      fail=1
+      continue
+    fi
+    version_at_least "$have" "$want"
+    case $? in
+      0) log "OK: $pkg $have >= $want" ;;
+      1) log "FAIL: $pkg $have is older than the required $want (security floor; the package mirror may be behind)"; fail=1 ;;
+      *) log "FAIL: cannot compare $pkg $have with $want (no version comparison tool in the image)"; fail=1 ;;
+    esac
+  done
+  IFS=$OLDIFS
 fi
 
 exit "$fail"
