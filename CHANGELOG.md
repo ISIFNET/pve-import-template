@@ -2,6 +2,27 @@
 
 本文件记录对 pve-import-template 的主要改动。
 
+## [2.3.0] - 2026-11-08
+
+### OpenSSH 10.6p2（musl + 无 PAM 的 sshd 密码认证绕过）
+
+- 新增模板键 `min_packages: {包名: 最低版本}`：构建信息 `/etc/pve-template-release` 写 `MIN_PACKAGE=<包> <版本>`，`verify-image.sh`
+  用镜像自己的包管理器核对（apk `version -t` / `dpkg --compare-versions` / rpm lua `vercmp`；Alpine 3.19–edge、Debian 13、Rocky 8 / 9
+  容器实测），没装、版本更低、比不了 = 构建失败、旧模板保持在役（镜像站滞后时不换成同样有漏洞的新构建）。进配方指纹：提高下限即全机队重建。
+- Alpine 3.22 / 3.23 / 3.24 带上 openssh-server 下限 `10.0_p1-r11` / `10.2_p1-r1` / `10.3_p1-r2`（Alpine 2026-11-05 回移的
+  `main/openssh: fix password authentication`）。已有的 Alpine 模板下一轮 sync 按配方变化重建（不等 `SOURCE_DELAY_HOURS`）。
+
+### EOL 模板不再获取
+
+- `templates.yaml` 新增顶层 `retired` 列表：ubuntu-18.04 / 20.04、debian-10 / 11、fedora-42、opensuse-leap-15.6 从 `templates` 挪过去。
+  import / sync / 向导 / `--all` / `@full` 都不再列出或构建；节点上已有的同名模板原样保留，`--list` 标 `eol, no longer fetched`
+  （JSON `dropped_eol: true`）。`manifest.py` 仍输出它们（`eol: true`、`retired: true`），供平台显示名与 EOL 标记。
+- 同一个名字同时在 `templates` 与 `retired` 里、retired 条目名字非法：读配置时报错。`import.py --list` 末尾列出 retired。
+
+### 新版本
+
+- 新增 opensuse-leap-16.1（2026-11-03 发布，支持到 2028-10-31）。Alpine 兜底地址更新到 3.22.8 / 3.23.8 / 3.24.4（discover 照常找最新）。
+
 ## [2.2.0] - 2026-11-06
 
 ### 回滚、hold、暂停、金丝雀

@@ -225,7 +225,7 @@ python3 import.py <storage-name> <start-vmid> [template-selector] [选项]
 
 | 选项 | 说明 |
 |------|------|
-| `--all` | 导入 `templates.yaml` 中的全部模板（含 EOL，忽略 `default_profile`） |
+| `--all` | 导入 `templates.yaml` 中的全部模板（不含 `retired`，忽略 `default_profile`） |
 | `--only-new` | 只导入 PVE 中尚不存在的模板 |
 | `--refresh` | 忽略缓存，强制重新下载镜像 |
 | `--mirror <name>` | 使用 `templates.yaml` 中配置的镜像源（内网环境） |
@@ -339,14 +339,14 @@ python3 update-templates.py 9000 9001 -y
 
 | 系列 | 模板 |
 |------|------|
-| Ubuntu（默认） | ubuntu-18.04 (EOL) / 20.04 (EOL) / 22.04 / 24.04 / **26.04** |
-| Debian（默认） | debian-10 (EOL) / 11 (EOL) / 12 / 13 |
+| Ubuntu（默认） | ubuntu-22.04 / 24.04 / **26.04** |
+| Debian（默认） | debian-12 / 13 |
 | CentOS Stream（默认） | centos-stream-9 / 10（自动找最新带日期构建） |
-| Alpine Linux（默认） | alpineLinux-3.22 / 3.23 / 3.24（自动找最新点版本） |
+| Alpine Linux（默认） | alpineLinux-3.22 / 3.23 / 3.24（自动找最新点版本；带 OpenSSH 安全下限，见下） |
 | Rocky Linux | rocky-8 / 9 / 10 |
 | AlmaLinux | almaLinux-8 / 9 / 10 |
-| Fedora | fedora-42 (EOL) / 43 / 44 / **45**（自动找当前构建号） |
-| openSUSE | opensuse-leap-15.6 (EOL) / 16.0 |
+| Fedora | fedora-43 / 44 / **45**（自动找当前构建号） |
+| openSUSE | opensuse-leap-16.0 / **16.1** |
 | Arch Linux | archLinux |
 
 默认导入哪些由 `templates.yaml` 的 `default_profile` 决定（默认 `standard`）：不指定模板时 `import.py` 导入这个配置组，向导默认勾选它，
@@ -356,11 +356,30 @@ sync 的 `ADD_MISSING` 在没写 `PROFILE` / `SELECTOR` 时也只补它。
 |---|---|---|
 | `minimal` | debian-13 / 12、ubuntu-24.04 / 22.04、rocky-9、alpineLinux-3.23（6 个） | 小硬盘 / 边缘节点 |
 | `standard`（默认） | debian-13 / 12、ubuntu-26.04 / 24.04 / 22.04、rocky-10 / 9 / 8、almaLinux-10 / 9 / 8、centos-stream-10 / 9、alpineLinux-3.24 / 3.23（15 个） | 常规节点 |
-| `full` | 全部（含 EOL、Fedora、openSUSE、Arch） | 按需 |
+| `full` | 全部（含 Fedora、openSUSE、Arch；不含 retired） | 按需 |
 
 组里只放安全支持期内的版本（测试钉死）。`eol` 写成日期（按 [endoflife.date](https://endoflife.date) 的安全支持截止日），到期后 sync 自动
-不再补这个模板、不按年龄重建；届时把它移出组、换上新版本即可。`python3 import.py --list` 按系列列出全部模板（`*` = 默认配置组，含支持期 / EOL / 自动发现 / 校验标记）。
-2026-11-05 全部 27 个地址与校验文件实测可用。
+不再补这个模板、不按年龄重建；届时把它移出组、换上新版本，并把整个条目挪进文末的 **`retired` 列表**（只留名字）。
+`python3 import.py --list` 按系列列出全部模板（`*` = 默认配置组，含支持期 / 自动发现 / 校验标记），末尾列出 retired。
+
+**retired（2.3.0 起）**：ubuntu-18.04 / 20.04、debian-10 / 11、fedora-42、opensuse-leap-15.6 已 EOL、不再获取——import / sync / 向导都不再
+列出或构建，`--all` / `@full` 也不含；节点上已有的同名模板原样保留（不重建、不退役、不回收），`sync-templates.py --list` 标
+`eol, no longer fetched`，确认没有链接克隆后自行删除。平台仍从 `manifest.py` 拿到它们的显示名与 EOL 标记（`retired: true`）。
+
+**安全下限 `min_packages`（2.3.0 起）**：2026-11-05 OpenSSH 10.6p2 修了一个 sshd 密码认证绕过——只影响 **musl libc + 不走 PAM** 的 Linux，
+Alpine 正是这种组合；客户要用密码登录，不能靠 `PasswordAuthentication no` 规避。Alpine 当天把补丁回移到 3.19–3.24 全部分支：
+
+| 分支 | 修复版本（openssh-server） |
+|---|---|
+| 3.22 | `10.0_p1-r11` |
+| 3.23 | `10.2_p1-r1` |
+| 3.24 | `10.3_p1-r2` |
+| edge | `10.6_p2-r0` |
+| 3.19 / 3.20 / 3.21（已 EOL，仍收到了回移） | `9.6_p1-r3` / `9.7_p1-r6` / `9.9_p2-r1` |
+
+构建时 `apk upgrade` 拿到修复版本；`verify-image.sh` 在镜像里核对（`apk version -t` / `dpkg --compare-versions` / rpm vercmp），镜像站滞后、
+没装或版本更低 = 构建失败、旧模板保持在役。`min_packages` 进配方指纹：提高下限 → 全机队下一轮自动重建该模板。glibc 的 Debian / Ubuntu /
+EL 走 PAM，不受这个漏洞影响。2026-11-08 全部 22 个地址与校验文件实测可用。
 
 ## 内置定制行为
 
@@ -468,6 +487,7 @@ mirrors:
 - `min_cpu_level`：宿主机至少要 x86-64-v<N>（EL10 的 rocky-10 / almaLinux-10 / centos-stream-10 为 3：没有 AVX2 的 CPU 上内核直接 panic）。
   达不到的节点 sync 记 `skipped`、不补缺；旧模板 cpu 不是 `host` / `max` / `x86-64-v3+` 时新模板改用 `host`。不参与配方指纹
 - `display_name`：平台显示名（`manifest.py` 输出；默认「系列名 + 版本」，如 `Debian 13`）。不参与配方指纹
+- `min_packages`：`{包名: 最低版本}` 安全下限，构建时在镜像里核对，不满足构建失败（见上「安全下限」）。**参与**配方指纹
 - `cloud_init`：是否启用 cloud-init
 - `net_tuning`：是否注入网络/内核调优（默认 `true`，设 `false` 关闭）
 - `unpack`：解压命令（支持 `{dl}` 和 `{img}` 占位符）
