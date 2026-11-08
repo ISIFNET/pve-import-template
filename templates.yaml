@@ -22,7 +22,11 @@
 #     min_cpu_level  宿主机至少要 x86-64-v<N>（EL10 = 3：没有 AVX2 的 CPU 上内核直接 panic）。不满足的节点 sync 记 skipped、
 #                 不补缺；模板 cpu 不是 host / max / x86-64-v3+ 时新模板改用 host
 #     display_name   平台显示名（manifest.py 输出；默认「系列名 + 版本」，如 Debian 13）
+#     min_packages   {包名: 最低版本}：安全下限（如某个漏洞的修复版本）。构建时 verify-image.sh 用镜像自己的包管理器比较
+#                 （apk version -t / dpkg --compare-versions / rpm vercmp），没装或低于下限 = 构建失败、旧模板保持在役。
+#                 它**进**配方指纹：提高下限会让全机队下一轮重建这个模板（拿到修复）
 #     eol / min_cpu_level / display_name 不进配方指纹：改它们不会触发重建
+# - 已 EOL、不再获取的模板放文末 retired 列表（只留 name）：不构建、不列出，只给平台留显示名与 EOL 标记
 # - 磁盘默认启用 discard 以回收精简置备存储空间，但不设置 ssd=1，不向访客伪装 SSD。
 
 # 默认配置组：python3 import.py <storage> <vmid> 不指定模板时导入它，run.sh / tui.py 向导默认勾选它，
@@ -160,30 +164,6 @@ mirrors:
 
 templates:
   # ===== Ubuntu =====
-  - name: ubuntu-18.04
-    url: https://cloud-images.ubuntu.com/releases/bionic/release/ubuntu-18.04-server-cloudimg-amd64.img
-    checksum: '{dir}/SHA256SUMS'
-    eol: true
-    cloud_init: true
-    customize:
-      uploads:
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      run:
-        - ./uploads/permit-root-login.sh
-        - ./uploads/install-qga.sh
-
-  - name: ubuntu-20.04
-    url: https://cloud-images.ubuntu.com/releases/focal/release/ubuntu-20.04-server-cloudimg-amd64.img
-    checksum: '{dir}/SHA256SUMS'
-    eol: true
-    cloud_init: true
-    customize:
-      uploads:
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      run:
-        - ./uploads/permit-root-login.sh
-        - ./uploads/install-qga.sh
-
   - name: ubuntu-22.04
     eol: '2027-06-01'
     url: https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img
@@ -221,30 +201,6 @@ templates:
         - ./uploads/install-qga.sh
 
   # ===== Debian =====
-  - name: debian-10
-    url: https://cloud.debian.org/images/cloud/buster/latest/debian-10-genericcloud-amd64.qcow2
-    checksum: '{dir}/SHA512SUMS'
-    eol: true
-    cloud_init: true
-    customize:
-      uploads:
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      run:
-        - ./uploads/permit-root-login.sh
-        - ./uploads/install-qga.sh
-
-  - name: debian-11
-    url: https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-genericcloud-amd64.qcow2
-    checksum: '{dir}/SHA512SUMS'
-    eol: true
-    cloud_init: true
-    customize:
-      uploads:
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      run:
-        - ./uploads/permit-root-login.sh
-        - ./uploads/install-qga.sh
-
   - name: debian-12
     eol: '2028-06-30'
     url: https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2
@@ -384,19 +340,7 @@ templates:
 
   # ===== Fedora =====
   # 文件名带构建号（44-1.7、45-1.4），每次重发都变：discover 找当前构建，checksum_pattern 找同目录的 CHECKSUM。
-  # 版本 EOL 后目录会搬到 archives（下载 404 → 退避一周、旧模板保持在役），届时把 url 改到 archives 并标 eol。
-  - name: fedora-42
-    url: https://archives.fedoraproject.org/pub/archive/fedora/linux/releases/42/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-42-1.1.x86_64.qcow2
-    checksum_pattern: 'Fedora-Cloud-42-(\d+)\.(\d+)-x86_64-CHECKSUM'
-    eol: true
-    cloud_init: true
-    customize:
-      uploads:
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      run:
-        - ./uploads/permit-root-login.sh
-        - ./uploads/install-qga.sh
-
+  # 版本 EOL 后目录会搬到 archives（下载 404 → 退避一周、旧模板保持在役）：到期就把条目挪进文末 retired 列表。
   - name: fedora-43
     eol: '2026-12-01'
     url: https://download.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2
@@ -443,18 +387,6 @@ templates:
         - ./uploads/install-qga.sh
 
   # ===== openSUSE =====
-  - name: opensuse-leap-15.6
-    url: https://download.opensuse.org/distribution/leap/15.6/appliances/openSUSE-Leap-15.6-Minimal-VM.x86_64-Cloud.qcow2
-    checksum: '{url}.sha256'
-    eol: true
-    cloud_init: true
-    customize:
-      uploads:
-        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
-      run:
-        - ./uploads/permit-root-login.sh
-        - ./uploads/install-qga.sh
-
   - name: opensuse-leap-16.0
     eol: '2027-10-31'
     url: https://download.opensuse.org/distribution/leap/16.0/appliances/Leap-16.0-Minimal-VM.x86_64-Cloud.qcow2
@@ -467,8 +399,18 @@ templates:
         - ./uploads/permit-root-login.sh
         - ./uploads/install-qga.sh
 
-  # 预发布，正式发布后再启用：
-  # - name: opensuse-leap-16.1
+  # 2026-11-03 发布（16.0 的继任，支持到 2028-10-31）；sshd 主配置同 16.0 在 /usr/etc，permit-root-login.sh 已处理
+  - name: opensuse-leap-16.1
+    eol: '2028-10-31'
+    url: https://download.opensuse.org/distribution/leap/16.1/appliances/Leap-16.1-Minimal-VM.x86_64-Cloud.qcow2
+    checksum: '{url}.sha256'
+    cloud_init: true
+    customize:
+      uploads:
+        - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
+      run:
+        - ./uploads/permit-root-login.sh
+        - ./uploads/install-qga.sh
 
   # ===== Arch Linux =====
   # 滚动发行、镜像每周重出：不在构建时 -Syu（大版本内核 / mkinitcpio 在 libguestfs 里跑风险大），靠重新下载拿新包
@@ -490,15 +432,22 @@ templates:
   # 3.24.2 起上游不再分 bios / uefi 两个变体（只剩 alpine-3.24.3-x86_64-cloudinit-r0.qcow2，-metal 是裸金属版不要）：
   # 3.24 的 pattern 两种都认、取版本最高。模板按 SeaBIOS 启动，切换前的开机冒烟会实测它——万一新镜像只能 UEFI 启动，
   # 构建失败、旧模板原样在役、sync 报 WARN；那时把 3.24 的 url 钉回 generic_alpine-3.24.1-x86_64-bios-cloudinit-r0.qcow2 并删掉 discover。
+  #
+  # min_packages = 安全下限（2026-11-05 OpenSSH 10.6p2：musl + 不走 PAM 的 sshd 密码认证可被绕过——Alpine 正是这种组合，
+  # 客户又要用密码登录，不能靠 PasswordAuthentication=no 规避）。Alpine 当天把补丁（main/openssh: fix password authentication）
+  # 回移到 3.19–3.24 全部分支，各分支的修复版本见下。构建时 apk upgrade 拿到它；镜像站滞后拿不到时 verify-image.sh 判构建失败、
+  # 旧模板保持在役（宁可不换也不换成同样有漏洞的新构建）。min_packages 进配方指纹：下限一改，全机队下一轮自动重建这个模板。
   - name: alpineLinux-3.22
     eol: '2027-05-01'
-    url: https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/alpine-3.22.7-x86_64-bios-cloudinit-r0.qcow2
+    url: https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/alpine-3.22.8-x86_64-bios-cloudinit-r0.qcow2
     discover:
       index: https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/
       pattern: '(?:generic_)?alpine-3\.22\.(\d+)-x86_64-bios-cloudinit-r(\d+)\.qcow2'
     checksum: '{url}.sha512'
     cloud_init: true
     net_tuning: false
+    min_packages:
+      openssh-server: '10.0_p1-r11'
     customize:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
@@ -509,13 +458,15 @@ templates:
 
   - name: alpineLinux-3.23
     eol: '2027-11-01'
-    url: https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/alpine-3.23.7-x86_64-bios-cloudinit-r0.qcow2
+    url: https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/alpine-3.23.8-x86_64-bios-cloudinit-r0.qcow2
     discover:
       index: https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/
       pattern: '(?:generic_)?alpine-3\.23\.(\d+)-x86_64-bios-cloudinit-r(\d+)\.qcow2'
     checksum: '{url}.sha512'
     cloud_init: true
     net_tuning: false
+    min_packages:
+      openssh-server: '10.2_p1-r1'
     customize:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
@@ -526,13 +477,15 @@ templates:
 
   - name: alpineLinux-3.24
     eol: '2028-06-01'
-    url: https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/cloud/alpine-3.24.3-x86_64-cloudinit-r0.qcow2
+    url: https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/cloud/alpine-3.24.4-x86_64-cloudinit-r0.qcow2
     discover:
       index: https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/cloud/
       pattern: '(?:generic_)?alpine-3\.24\.(\d+)-x86_64-(?:bios-)?cloudinit-r(\d+)\.qcow2'
     checksum: '{url}.sha512'
     cloud_init: true
     net_tuning: false
+    min_packages:
+      openssh-server: '10.3_p1-r2'
     customize:
       uploads:
         - ./uploads/ssh.cfg:/etc/cloud/cloud.cfg.d/50_ssh.cfg
@@ -540,3 +493,14 @@ templates:
       run:
         - ./uploads/permit-root-login.sh
         - ./uploads/install-qga.sh
+
+# 已停止维护、不再获取的模板：import / sync / 向导都不再列出或构建它们，节点上已有的同名模板原样保留（不重建、不退役、不回收，
+# 运维确认没有链接克隆后自行删除）。只为平台保留显示名与「已 EOL」标记（manifest.py 输出 retired: true），客户列表据此标 EOL、
+# 默认系统不会选它。EOL 到期的条目整段从 templates 挪到这里（只留 name，需要时加 display_name）。
+retired:
+  - name: ubuntu-18.04
+  - name: ubuntu-20.04
+  - name: debian-10
+  - name: debian-11
+  - name: fedora-42
+  - name: opensuse-leap-15.6

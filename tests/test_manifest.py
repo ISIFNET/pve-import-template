@@ -29,7 +29,8 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(self.doc['default_profile'], 'standard')
         self.assertEqual(set(self.doc['profiles']), {'minimal', 'standard', 'full'})
         self.assertIn('rocky-9', self.doc['profiles']['minimal'])
-        self.assertEqual(len(self.doc['profiles']['full']), len(self.doc['templates']))
+        # @full = 全部在维护的；retired 只给平台显示名与 EOL 标记，不进任何组
+        self.assertEqual(len(self.doc['profiles']['full']), len([t for t in self.doc['templates'] if not t['retired']]))
         self.assertEqual(list(self.doc), ['tool_version', 'default_profile', 'profiles', 'templates'])
 
     def test_display_names(self):
@@ -44,19 +45,32 @@ class ManifestTest(unittest.TestCase):
 
     def test_eol_and_cpu_level(self):
         self.assertIs(self.by_name['debian-10']['eol'], True)
+        self.assertIs(self.by_name['debian-10']['retired'], True)
+        self.assertIs(self.by_name['debian-13']['retired'], False)
         self.assertEqual(self.by_name['debian-13']['eol'], '2030-06-30')
         self.assertIsNone(self.by_name['archLinux']['eol'])
         self.assertEqual(self.by_name['rocky-10']['min_cpu_level'], 3)
         self.assertIsNone(self.by_name['rocky-9']['min_cpu_level'])
         for t in self.doc['templates']:
-            self.assertEqual(set(t), {'name', 'family', 'family_label', 'version', 'display_name', 'eol', 'min_cpu_level'})
+            self.assertEqual(set(t), {'name', 'family', 'family_label', 'version', 'display_name', 'eol', 'min_cpu_level', 'retired'})
+
+    def test_retired_entries_are_eol_and_out_of_every_profile(self):
+        retired = [t for t in self.doc['templates'] if t['retired']]
+        self.assertEqual({t['name'] for t in retired},
+                         {'ubuntu-18.04', 'ubuntu-20.04', 'debian-10', 'debian-11', 'fedora-42', 'opensuse-leap-15.6'})
+        for t in retired:
+            self.assertIs(t['eol'], True, t['name'])
+            for names in self.doc['profiles'].values():
+                self.assertNotIn(t['name'], names)
+        self.assertEqual(self.by_name['debian-11']['display_name'], 'Debian 11')
 
     def test_overrides_and_odd_yaml_values(self):
         cfg = {'templates': [{'name': 'debian-13', 'display_name': 'Debian 13 (Trixie)', 'eol': datetime.date(2030, 6, 30)},
                              {'name': 'ubuntu-26.04', 'eol': False, 'min_cpu_level': '2'}],
-               'profiles': {'tiny': ['debian-13']}}
+               'profiles': {'tiny': ['debian-13']}, 'retired': ['debian-9', {'name': 'centos-7', 'display_name': 'CentOS 7'}]}
         doc = manifest.build_manifest(imp, cfg)
-        a, b = doc['templates']
+        a, b, c, d = doc['templates']
+        self.assertEqual((c['name'], c['eol'], c['retired'], d['display_name']), ('debian-9', True, True, 'CentOS 7'))
         self.assertEqual((a['display_name'], a['eol']), ('Debian 13 (Trixie)', '2030-06-30'))
         self.assertEqual((b['eol'], b['min_cpu_level']), (None, 2))
         self.assertEqual(doc['profiles'], {'tiny': ['debian-13']})

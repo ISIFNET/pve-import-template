@@ -713,6 +713,8 @@ def list_mode(node: str, conf: dict, as_json: bool):
     imp = load_import_module()
     config = imp.load_config()
     yaml_by_name = {t['name'].lower(): t for t in config.get('templates') or []}
+    # 已停止维护、移出获取列表的（templates.yaml retired）：节点上的同名模板不再重建，运维确认没有链接克隆后自行删除
+    dropped = {t['name'].lower() for t in imp.retired_templates(config)}
     selector = conf['SELECTOR'] or ('@' + conf['PROFILE'] if conf['PROFILE'] else '')
     maintained = {t['name'].lower() for t in select_templates(imp, config, selector)}
     keep = int(conf['KEEP_RETIRED'])
@@ -749,6 +751,7 @@ def list_mode(node: str, conf: dict, as_json: bool):
         rows.append({
             'vmid': vm['vmid'], 'name': vm['name'], 'state': state, 'managed': bool(vm['meta']), 'retired': vm['retired'],
             'in_range': ranged, 'in_yaml': tpl is not None, 'yaml_name': tpl['name'] if tpl else None,
+            'dropped_eol': tpl is None and base.lower() in dropped,
             'eol': pitlib.is_eol(tpl) if tpl else None, 'maintained': bool(tpl) and base.lower() in maintained,
             'storage': volid.split(':', 1)[0] if ':' in volid else None,
             'hookscript': bool(str(cfg.get('hookscript') or '').strip()),
@@ -765,7 +768,9 @@ def list_mode(node: str, conf: dict, as_json: bool):
     for r in rows:
         built = time.strftime('%Y-%m-%d %H:%M', time.gmtime(r['built_at'])) if r['built_at'] else '-'
         flags = []
-        if not r['in_yaml']:
+        if r['dropped_eol']:
+            flags.append('eol, no longer fetched (delete once nothing is cloned from it)')
+        elif not r['in_yaml']:
             flags.append('not-in-yaml')
         else:
             if r['eol']:

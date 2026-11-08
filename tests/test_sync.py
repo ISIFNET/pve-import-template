@@ -59,16 +59,20 @@ class FakeNode:
 class FakeImport:
     TOOL_VERSION = '2.0.0'
 
-    def __init__(self, node, templates, fail=None):
+    def __init__(self, node, templates, fail=None, retired=None):
         self.node = node
         self.templates = templates
+        self.retired = retired or []
         self.fail = fail or {}
         self.built = []
         self.extra_configs = []
 
     def load_config(self):
-        return {'templates': self.templates, 'default_profile': 'standard',
+        return {'templates': self.templates, 'default_profile': 'standard', 'retired': self.retired,
                 'profiles': {'standard': [t['name'] for t in self.templates if not t.get('in_full_only')]}}
+
+    def retired_templates(self, config):
+        return [{'name': n} for n in config.get('retired') or []]
 
     def match_templates(self, tpls, expr):
         if '@' in expr:

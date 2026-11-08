@@ -13,8 +13,9 @@ templates.manifest.json（下单页的系统列表 / 显示名 / 支持期 / CPU
     "profiles": {"minimal": ["debian-13", ...], ...},        配置组展开后的模板名（保持 templates.yaml 顺序）
     "templates": [
       {"name": "debian-13", "family": "debian", "family_label": "Debian", "version": "13",
-       "display_name": "Debian 13", "eol": "2030-06-30", "min_cpu_level": null},
+       "display_name": "Debian 13", "eol": "2030-06-30", "min_cpu_level": null, "retired": false},
       ...
+      {"name": "debian-11", ..., "eol": true, "retired": true}             templates.yaml 的 retired 列表（不再获取）
     ]
   }
 
@@ -23,6 +24,7 @@ templates.manifest.json（下单页的系统列表 / 显示名 / 支持期 / CPU
   yaml 条目写了 display_name 就用它
 - eol："YYYY-MM-DD"（到这天停止安全支持）/ true（已 EOL）/ null（没写）
 - min_cpu_level：宿主机至少要 x86-64-v<N>（EL10 = 3），没要求为 null
+- retired：true = 已 EOL、不再获取（不构建、不维护）；平台只拿它的显示名与 EOL 标记，节点上的同名模板算「不再维护」
 只读 templates.yaml，不碰 PVE；告警走 stderr。退出码：0 成功 / 2 依赖缺失或 yaml 有误。
 """
 
@@ -68,7 +70,7 @@ def build_manifest(imp, config: dict) -> dict:
     for profile in config.get('profiles') or {}:
         profiles[profile] = [t['name'] for t in imp.match_templates(tpls, '@' + profile, config=config)]
     templates = []
-    for t in tpls:
+    for t, retired in [(t, False) for t in tpls] + [(t, True) for t in imp.retired_templates(config)]:
         family = imp.template_family(t)
         label = imp.family_label(family)
         version = template_version(t['name'])
@@ -79,8 +81,9 @@ def build_manifest(imp, config: dict) -> dict:
             'family_label': label,
             'version': version,
             'display_name': str(t.get('display_name') or ('%s %s' % (label, version) if version else label)),
-            'eol': eol_value(t.get('eol')),
+            'eol': True if retired else eol_value(t.get('eol')),
             'min_cpu_level': int(level) if level not in (None, '') else None,
+            'retired': retired,
         })
     return {'tool_version': imp.TOOL_VERSION, 'default_profile': imp.default_profile(config),
             'profiles': profiles, 'templates': templates}

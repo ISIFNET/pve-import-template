@@ -523,9 +523,11 @@ class ReportShapeTest(Base):
         self.node.add(900, 'debian-13')                                              # 区间外
         self.node.add(9011, 'my-custom', lock='backup')                               # 不在 yaml
         self.node.add(9012, 'debian-10', cfg={'protection': '1'})
+        self.node.add(9013, 'ubuntu-20.04')                                          # 已移进 retired（不再获取）
         self.retired_tpl(9020, 'debian-13', 30)
         self.retired_tpl(9021, 'debian-13', 20)
-        imp = FakeImport(self.node, [{'name': 'debian-13', 'url': 'https://d/13'}, {'name': 'debian-10', 'url': 'https://d/10', 'eol': True}])
+        imp = FakeImport(self.node, [{'name': 'debian-13', 'url': 'https://d/13'}, {'name': 'debian-10', 'url': 'https://d/10', 'eol': True}],
+                         retired=['ubuntu-20.04'])
         out = io.StringIO()
         with mock.patch.object(sync, 'load_import_module', lambda: imp), mock.patch('sys.stdout', out):
             sync.list_mode('pve1', self.conf_with(SELECTOR='debian-13'), True)
@@ -536,6 +538,7 @@ class ReportShapeTest(Base):
         self.assertEqual((rows[9011]['in_yaml'], rows[9011]['lock']), (False, 'backup'))
         self.assertEqual((rows[9012]['eol'], rows[9012]['maintained'], rows[9012]['protection'], rows[9012]['state']),
                          (True, False, True, 'legacy'))
+        self.assertEqual((rows[9013]['in_yaml'], rows[9013]['dropped_eol'], rows[9011]['dropped_eol']), (False, True, False))
         self.assertEqual((rows[9020]['reclaimable'], rows[9021]['reclaimable']), (True, False))   # 保留最新 1 个
         self.assertGreater(rows[9020]['retired_for_s'], 29 * 86400)
 
