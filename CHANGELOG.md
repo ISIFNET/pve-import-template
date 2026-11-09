@@ -2,6 +2,17 @@
 
 本文件记录对 pve-import-template 的主要改动。
 
+## [2.3.1] - 2026-11-09
+
+### 深度冒烟误判 cloud-init 出错（所有发行版）
+
+- 冒烟 VM 不接网卡，但 PVE 8.1+ 克隆默认 `ciupgrade=1`（user-data 写 `package_upgrade: true`）：首次开机升级软件包必失败，cloud-init 整体报
+  `status: error`，深度冒烟把好模板判成坏的、旧模板一直不换（2026-11-08 HORSEA-2 的 Alpine 3.22 / 3.23 / 3.24 全部因此失败）。
+  冒烟 VM 现在设 `--ciupgrade 0`；PVE 不认这个选项（< 8.1）时去掉重试。
+- cloud-init 报 error 后经 qga 取回出错的模块（`/run/cloud-init/result.json` 的 `errors`，没有就读 `cloud-init status --long`），
+  失败原因写出是哪个模块、什么错，不再只有一句 `status: error`。只有要联网的模块（`package_update_upgrade_install` / `ssh_import_id`）
+  出错时放行并记告警（PVE < 8.1 把 `package_upgrade: true` 写死在 user-data 里，关不掉）。
+
 ## [2.3.0] - 2026-11-08
 
 ### OpenSSH 10.6p2（musl + 无 PAM 的 sshd 密码认证绕过）
