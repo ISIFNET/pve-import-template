@@ -250,12 +250,57 @@ class BuildV22Test(BuildTemplateTest):
         self.assertEqual(execs[-1][-3:-1], ['sh', '-c'])
         self.assertIn('sshd', execs[-1][-1])
 
-    def test_deep_smoke_cloud_init_error_fails_the_build(self):
-        self.exec_replies = [self.exec_json(1, 'status: error\n')]
+    @staticmethod
+    def cloud_init_report(errors, status_long='status: error\n'):
+        import json
+        return json.dumps({'v1': {'datasource': 'DataSourceNoCloud', 'errors': errors}}) + '\n@@pit@@\n' + status_long + '\n@@pit@@\n'
+
+    def test_deep_smoke_cloud_init_error_fails_the_build_and_names_the_module(self):
+        # 真的坏了（如注入脚本弄坏了 cc_set_passwords）：失败原因写出是哪个模块、什么错，不再只有一句 status: error
+        self.exec_replies = [self.exec_json(1, 'status: error\n'),
+                             self.exec_json(0, self.cloud_init_report(["('set_passwords', ProcessExecutionError('chpasswd: bad'))"]))]
         with self.assertRaises(pitlib.PitError) as ctx:
             self.deep()
-        self.assertIn('cloud-init finished with an error: status: error', str(ctx.exception))
+        self.assertIn('cloud-init finished with an error', str(ctx.exception))
+        self.assertIn('set_passwords', str(ctx.exception))
         self.assertTrue(any(c.args[0][:3] == ['qm', 'destroy', '9042'] for c in imp.subprocess.run.call_args_list))
+
+    def test_deep_smoke_tolerates_cloud_init_errors_caused_by_having_no_network(self):
+        # 冒烟 VM 不接网卡：PVE < 8.1 的 user-data 写死 package_upgrade: true，apk / apt 升级必失败——不算模板坏（2026-11-08 HORSEA-2）
+        self.exec_replies = [self.exec_json(1, 'status: error\n'),
+                             self.exec_json(0, self.cloud_init_report(
+                                 ["('package_update_upgrade_install', ProcessExecutionError(\"Command: ['apk', 'update']\"))"])),
+                             self.exec_json(0)]
+        meta = self.deep()
+        self.assertEqual(len(meta['warnings']), 1)
+        self.assertIn('need the network', meta['warnings'][0])
+
+    def test_deep_smoke_reads_errors_from_status_long_when_result_json_is_missing(self):
+        self.exec_replies = [self.exec_json(1, 'status: error\n'),
+                             self.exec_json(0, '\n@@pit@@\nstatus: error\nerrors:\n\t- (ssh) Failed to restart sshd\nrecoverable_errors: {}\n@@pit@@\n')]
+        with self.assertRaises(pitlib.PitError) as ctx:
+            self.deep()
+        self.assertIn('(ssh) Failed to restart sshd', str(ctx.exception))
+
+    def test_smoke_vm_turns_off_cloud_init_package_upgrades(self):
+        self.build(9042, smoke_timeout=60, smoke_allocate=lambda: 9999)
+        sets = [c for c in self.commands if c[:3] == ['qm', 'set', '9999']]
+        self.assertEqual(sets[0][-2:], ['--ciupgrade', '0'])
+
+    def test_smoke_vm_on_pve_without_ciupgrade_retries_without_it(self):
+        orig = pitlib.run_cmd.side_effect
+
+        def run_cmd(argv, **kw):
+            a = [str(x) for x in argv]
+            if a[:3] == ['qm', 'set', '9999'] and '--ciupgrade' in a:
+                self.commands.append(a)
+                raise pitlib.CommandError('qm set failed', 255, 'Unknown option: ciupgrade\n400 unable to parse option')
+            return orig(argv, **kw)
+        pitlib.run_cmd.side_effect = run_cmd
+        self.build(9042, smoke_timeout=60, smoke_allocate=lambda: 9999)
+        sets = [c for c in self.commands if c[:3] == ['qm', 'set', '9999']]
+        self.assertEqual(len(sets), 2)
+        self.assertNotIn('--ciupgrade', sets[1])
 
     def test_deep_smoke_cloud_init_still_running_at_the_deadline_fails(self):
         self.exec_replies = [self.exec_json(0, 'status: running\n')] * 50

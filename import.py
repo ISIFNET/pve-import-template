@@ -986,6 +986,21 @@ SMOKE_SSH_FAILURES = {
     14: 'the sshd service is not running',
 }
 SMOKE_POLL_SECONDS = 10
+
+# 冒烟 VM 不接网卡：这些 cloud-init 模块要联网，失败是这个环境造成的，不代表模板坏了。
+# PVE 8.1 起克隆默认 ciupgrade=1（user-data 写 package_upgrade: true），冒烟 VM 会设 --ciupgrade 0 关掉；
+# 更早的 PVE 把 package_upgrade: true 写死在生成的 user-data 里、关不掉，只能在这里认出来放行（记告警）
+SMOKE_NETWORK_MODULES = ('package_update_upgrade_install', 'package-update-upgrade-install',
+                         'ssh_import_id', 'ssh-import-id')
+
+# cloud-init 报 error 时把「哪个模块、什么错」取回来：result.json 的 errors（权威）、status --long、日志里的告警行
+CLOUD_INIT_ERRORS_SCRIPT = r'''
+cat /run/cloud-init/result.json 2>/dev/null
+echo '@@pit@@'
+cloud-init status --long 2>&1 | tail -n 40
+echo '@@pit@@'
+grep -E 'WARNING|ERROR|Traceback' /var/log/cloud-init.log 2>/dev/null | tail -n 15
+'''
 SMOKE_SSH_ATTEMPTS = 3
 
 
@@ -1009,8 +1024,15 @@ def smoke_deep_checks(vmid: int, deadline: float, log, sleep=None) -> list:
                 log(f'smoke test: cloud-init status: {status}')
                 break
             if status == 'error':
+                errors, detail = cloud_init_errors(vmid)
+                if errors and all(any(m in e.lower() for m in SMOKE_NETWORK_MODULES) for e in errors):
+                    warnings.append('cloud-init reported errors only from modules that need the network, which the smoke-test VM '
+                                    'does not have (ignored): %s' % '; '.join(e[:160] for e in errors)[:400])
+                    log('Warning: ' + warnings[-1])
+                    break
+                why = '; '.join(errors) if errors else (detail or ' '.join(text.split()))
                 raise pitlib.PitError('smoke test failed: cloud-init finished with an error: %s'
-                                      % ' '.join(text.split())[:300])
+                                      % ' '.join(why.split())[:500])
             if time.time() >= deadline:
                 raise pitlib.PitError('smoke test failed: cloud-init still %s when the smoke-test time ran out'
                                       % (status or 'not finished'))
@@ -1045,6 +1067,39 @@ def smoke_deep_checks(vmid: int, deadline: float, log, sleep=None) -> list:
             continue
         break
     raise pitlib.PitError('smoke test failed: ' + last)
+
+
+def cloud_init_errors(vmid: int) -> tuple:
+    """cloud-init 报 error 后取回出错的模块与原因：(errors, detail)。errors 来自 /run/cloud-init/result.json 的 v1.errors
+    （每条形如 "('package_update_upgrade_install', ProcessExecutionError(...))"），读不到时退回 `cloud-init status --long`
+    的 errors 段；detail 是 status --long 与日志告警行的摘要，给失败原因用。取不到返回 ([], '')。"""
+    try:
+        res = pitlib.guest_exec(vmid, ['sh', '-c', CLOUD_INIT_ERRORS_SCRIPT], timeout=30)
+    except pitlib.PitError:
+        return [], ''
+    parts = (res.get('out') or '').split('@@pit@@')
+    errors = []
+    try:
+        doc = json.loads(parts[0].strip() or 'null')
+        v1 = doc.get('v1') if isinstance(doc, dict) else None
+        errors = [str(e) for e in ((v1 or {}).get('errors') or []) if str(e).strip()]
+    except ValueError:
+        pass
+    status_long = parts[1] if len(parts) > 1 else ''
+    if not errors:
+        in_errors = False
+        for line in status_long.splitlines():
+            if re.match(r'^\s*errors:\s*$', line):
+                in_errors = True
+                continue
+            if in_errors:
+                m = re.match(r'^\s+-\s*(.+)$', line)
+                if m:
+                    errors.append(m.group(1).strip())
+                elif line.strip() and not line.startswith((' ', '\t')):
+                    break
+    detail = ' | '.join(' '.join(p.split()) for p in parts[1:] if p.strip())
+    return errors, detail
 
 
 def smoke_test(template_vmid: int, allocate, timeout: int, log, memory: int = 512, deep: bool = False,
@@ -1089,7 +1144,14 @@ def smoke_test(template_vmid: int, allocate, timeout: int, log, memory: int = 51
         if drop:
             # 不接网（不会 DHCP、不碰客户网络）；不跑 hook（hook 会注入路由 / 上报事件）
             args += ['--delete', ','.join(drop)]
-        pitlib.run_cmd(args, timeout=120, log=log)
+        # 不接网就别让 cloud-init 首次开机升级软件包（PVE 8.1+ 默认 ciupgrade=1）：没网必失败，cloud-init 整体报 error，
+        # 深度冒烟误判模板坏了（2026-11-08 HORSEA-2 三个 Alpine 全因此失败）。平台开通时自己显式设 ciupgrade
+        try:
+            pitlib.run_cmd(args + ['--ciupgrade', '0'], timeout=120, log=log)
+        except pitlib.CommandError as e:
+            if 'ciupgrade' not in (e.output or '').lower():
+                raise
+            pitlib.run_cmd(args, timeout=120, log=log)   # PVE < 8.1 没有这个选项
         pitlib.run_cmd(['qm', 'start', tmp], timeout=180, log=log)
         deadline = time.time() + timeout
         while True:
